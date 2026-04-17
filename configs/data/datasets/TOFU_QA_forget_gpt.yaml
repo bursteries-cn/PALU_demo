@@ -1,0 +1,14 @@
+TOFU_QA_forget_gpt:
+  handler: QAwithLabelDataset
+  args:
+    hf_args:
+      name: "forget10"
+      dataset: "TOFU"
+      classifier: "gpt"
+      # split: "train"
+      # path: "locuslab/TOFU"
+    question_key: "question"
+    answer_key: "answer"
+    target_key: "target_words"
+    common_key: "common_words"
+    max_length: 512
