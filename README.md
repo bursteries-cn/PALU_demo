@@ -91,13 +91,13 @@ This work builds upon [Open-Unlearning](https://github.com/locuslab/open-unlearn
 If you find our work useful, please consider citing:
 
 ```bibtex
-@article{zhai2026maximizing,
-  title={Maximizing local entropy where it matters: Prefix-aware localized llm unlearning},
-  author={Zhai, Naixin and Shao, Pengyang and Zheng, Binbin and Yang, Yonghui and Shen, Fei and Bai, Long and Yang, Xun},
-  journal={arXiv preprint arXiv:2601.03190},
-  year={2026}
+@inproceedings{
+zhai2026maximizing,
+title={Maximizing Local Entropy Where It Matters: Prefix-Aware Localized {LLM} Unlearning},
+author={Zhai, Naixin and Shao, Pengyang and Zheng, Binbin and Yang, Yonghui and Shen, Fei and Bai, Long and Yang, Xun},
+booktitle={The 64th Annual Meeting of the Association for Computational Linguistics},
+year={2026},
 }
-
 ```
 
 ## 📝 License
