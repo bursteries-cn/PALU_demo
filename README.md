@@ -15,6 +15,8 @@ Maximizing Local Entropy Where It Matters: Prefix-Aware Localized LLM Unlearning
 
 ## 🔥 News
 
+- 202607: Our work is awarded as the Outstanding Paper! Further details of the experiments will be updated soon.
+- 202604: Our work is accepted by the ACL 2026 Main Conference and recommended as an Oral presentation!
 
 ## ⚡ Installation
 
@@ -91,12 +93,12 @@ This work builds upon [Open-Unlearning](https://github.com/locuslab/open-unlearn
 If you find our work useful, please consider citing:
 
 ```bibtex
-@inproceedings{
-zhai2026maximizing,
-title={Maximizing Local Entropy Where It Matters: Prefix-Aware Localized {LLM} Unlearning},
-author={Zhai, Naixin and Shao, Pengyang and Zheng, Binbin and Yang, Yonghui and Shen, Fei and Bai, Long and Yang, Xun},
-booktitle={The 64th Annual Meeting of the Association for Computational Linguistics},
-year={2026},
+@inproceedings{zhai2026maximizing,
+  title={Maximizing local entropy where it matters: Prefix-aware localized llm unlearning},
+  author={Zhai, Naixin and Shao, Pengyang and Zheng, Binbin and Yang, Yonghui and Shen, Fei and Bai, Long and Yang, Xun},
+  booktitle={Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)},
+  pages={19514--19531},
+  year={2026}
 }
 ```
 
