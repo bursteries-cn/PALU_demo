@@ -4,7 +4,7 @@ TOFU_QA_forget_pert:
     hf_args:
       name: "forget10_perturbed"
       split: "train"
-      path: "locuslab/TOFU"
+      path: "/mnt/sda/cr/LLM_unlearning/datset/TOFU"
     question_key: "question"
     answer_key: "perturbed_answer"
     max_length: 512
