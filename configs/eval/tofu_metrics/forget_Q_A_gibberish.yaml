@@ -14,7 +14,7 @@ text_key: generation
 device: cuda
 
 classifier_model_args:
-  pretrained_model_name_or_path: "madhurjindal/autonlp-Gibberish-Detector-492513457"
+  pretrained_model_name_or_path: "/mnt/sda/cr/LLM_unlearning/PALU/models/gibberish-detector"
 
 classifier_tokenization_args:
-  pretrained_model_name_or_path: "madhurjindal/autonlp-Gibberish-Detector-492513457"
+  pretrained_model_name_or_path: "/mnt/sda/cr/LLM_unlearning/PALU/models/gibberish-detector"
