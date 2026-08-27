@@ -177,3 +177,6 @@ cython_debug/
 
 .vscode/
 *.whl
+# Local models and training outputs
+/models/
+/saves/unlearn/
