@@ -21,7 +21,7 @@ bz_set=("8 4")
 target_mode_set=("mean")
 alpha_set=(2)
 topk_set=(5000)
-first_n_set=(2)
+first_n_set=(3)
 epoch_set=(10)
 
 for split in "${splits[@]}"; do
