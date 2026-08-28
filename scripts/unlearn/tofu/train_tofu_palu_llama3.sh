@@ -2,7 +2,7 @@ DATE=$(date "+%m%d")
 TIME=$(date "+%H%M%S")
 
 
-export CUDA_VISIBLE_DEVICES=0,
+export CUDA_VISIBLE_DEVICES=1,
 MODEL="Llama-3.1-8B-Instruct"
 
 REPORTTO="wandb"
