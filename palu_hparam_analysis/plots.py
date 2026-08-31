@@ -125,6 +125,84 @@ def plot_coverage(
     )
 
 
+def plot_parameter_guidance(
+    summary: list[dict[str, Any]], output_stem: Path, config: dict[str, Any]
+) -> list[str]:
+    """Compact evidence plot for sparse data; untested levels stay visibly untested."""
+    if not any(entry.get("score_median") is not None for entry in summary):
+        return []
+    apply_publication_style()
+    fig, axes = plt.subplots(2, 2, figsize=(8.2, 5.8), constrained_layout=True)
+    for panel, (ax, factor) in enumerate(zip(axes.flat, FACTORS)):
+        entries = [entry for entry in summary if entry["factor"] == factor]
+        x = np.arange(len(entries), dtype=float)
+        tested_x = []
+        medians = []
+        lower = []
+        upper = []
+        for index, entry in enumerate(entries):
+            score = entry.get("score_median")
+            if score is None:
+                ax.scatter(index, 0.035, marker="x", s=22, color="#8a98a6", linewidths=1.0)
+                ax.text(index, 0.085, "not run", ha="center", va="bottom", fontsize=6, color="#6f7c88")
+                continue
+            tested_x.append(index)
+            medians.append(float(score))
+            lower.append(float(entry.get("score_q25", score)))
+            upper.append(float(entry.get("score_q75", score)))
+            if entry.get("promising"):
+                ax.axvspan(index - 0.38, index + 0.38, color=OKABE_ITO[1], alpha=0.16, zorder=0)
+            ax.text(
+                index,
+                min(0.98, float(entry.get("score_q75", score)) + 0.055),
+                f"n={entry['n_configurations']}",
+                ha="center",
+                va="bottom",
+                fontsize=6,
+            )
+        if tested_x:
+            means = np.array(medians, dtype=float)
+            low = np.array(lower, dtype=float)
+            high = np.array(upper, dtype=float)
+            ax.errorbar(
+                tested_x,
+                means,
+                yerr=np.vstack([means - low, high - means]),
+                color=OKABE_ITO[0],
+                marker="o",
+                markersize=4.5,
+                linewidth=1.2,
+                capsize=3,
+                zorder=3,
+            )
+        ax.set_xticks(x)
+        ax.set_xticklabels(
+            [display_factor_value(factor, entry["value"]) for entry in entries],
+            rotation=28,
+            ha="right",
+        )
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("Observed desirability percentile")
+        ax.set_xlabel(FACTOR_LABELS[factor])
+        ax.set_title(
+            f"{chr(65 + panel)}  {FACTOR_LABELS[factor]}",
+            loc="left",
+            fontweight="bold",
+        )
+        ax.grid(axis="y", color="#e4e8ec", linewidth=0.6)
+    fig.suptitle(
+        "Observed parameter guidance (median and IQR; orange bands mark current promising levels)\n"
+        "Descriptive under sparse, confounded coverage — not a causal effect estimate",
+        fontsize=10,
+    )
+    return save_figure(
+        fig,
+        output_stem,
+        config["output"]["static_formats"],
+        int(config["output"]["dpi"]),
+    )
+
+
 def plot_main_effects(
     result: dict[str, Any], output_stem: Path, config: dict[str, Any]
 ) -> list[str]:

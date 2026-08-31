@@ -1,16 +1,12 @@
-# PALU sparse hyperparameter analysis
+# PALU sparse hyperparameter record and guidance
 
-This module analyzes `lr`, `alpha`, `top_k`, and `first_n` against:
+This module keeps a compact record of PALU experiments over `lr`, `alpha`,
+`top_k`, and `first_n`, then uses only the available results to indicate which
+values currently look more promising.
 
-- `model_utility` (larger is better)
-- `forget_quality` (larger KS-test p-value is closer to the Retain distribution;
-  it is not a forgetting percentage)
-- `forget_Q_A_gibberish` (larger class-0/clean probability is better)
-- `exact_memorization` (distance to the Retain baseline is minimized)
-
-It is designed for incomplete, unbalanced grids. Raw metric values are never
-imputed. Observed rankings, adjusted surrogate estimates, and proposed next runs
-are kept separate in every output.
+It is intentionally designed for an incomplete grid. It does **not** require a
+full Cartesian sweep, fill missing metric values, or label an untested
+configuration as the best result.
 
 ## Run
 
@@ -23,18 +19,54 @@ python3 -m palu_hparam_analysis.cli \
   --out reports/hparam_analysis/forget05_llama31
 ```
 
-The default is a fixed epoch-10 comparison. To inspect each run's last available
-checkpoint instead:
+The default compares epoch 10. To record the last evaluated checkpoint from each
+run instead:
 
 ```bash
 python3 -m palu_hparam_analysis.cli --checkpoint-policy last
 ```
 
-The report is a self-contained HTML file: `report.html`. It does not contact a
-CDN or require a running web service. Static PNG/PDF/SVG figures and all
-machine-readable tables are written beside it.
+Models are analyzed separately. For example, use `--model
+Llama-2-7b-chat-hf` together with Llama-2 Full/Retain baseline paths in a
+model-specific analysis config.
 
-## Metadata and protocol rules
+## What the report answers
+
+1. Which parameter combinations have a result at the selected checkpoint?
+2. Which combinations have runs, but not the selected checkpoint?
+3. Which planned combinations have not been run?
+4. Among tested levels, which one or two values currently have the best median
+   relative performance?
+5. Which small set of one-parameter neighboring experiments would most directly
+   refine the current promising region?
+
+The compact guidance score is the equal-weight mean of direction-aligned metric
+percentiles within the current observed set. A metric participates when it has at
+least two observations and is available for at least half of the configurations.
+If a participating metric is missing from one configuration, that configuration
+receives zero credit for the missing value. The score is a search aid, not a
+paper metric or causal effect.
+
+`forget_quality` remains a KS-test p-value, not a forgetting percentage.
+`exact_memorization` is scored by distance to the Retain baseline when that
+baseline is available; otherwise lower is treated as better and the report emits
+a warning.
+
+## Main outputs
+
+- `report.html`: compact guidance, value summaries, next local probes, and a
+  filterable experiment ledger
+- `tables/experiment_ledger.csv`: one row per planned combination with status
+  `tested`, `other_checkpoint`, or `missing`
+- `tables/observed_configurations.csv`: observed metrics aggregated by parameter
+  combination
+- `tables/parameter_value_summary.csv`: support counts and metric medians for
+  every configured value
+- `tables/recommended_next_experiments.csv`: a short list of untested one-step
+  neighbors of the strongest observed configurations
+- `coverage_audit.json` and `provenance.json`: machine-readable audit context
+
+## Metadata and comparison boundary
 
 Metadata precedence is:
 
@@ -42,46 +74,8 @@ Metadata precedence is:
 2. `trainer_state.json` for checkpoint-step to epoch mapping
 3. the run-directory suffix as a compatibility fallback
 
-Conflicts are reported. By default only the largest identical protocol cohort is
-modeled. The fingerprint includes model, split, trainer, attention implementation,
-dtype, effective batch, target mode, gamma, retain-loss type, Retain reference,
-gibberish-classifier settings, and generation settings. Use
-`--allow-mixed-protocols` only when those differences are intentionally in scope.
-
-## Statistical boundary
-
-The primary surrogate is categorical Ridge regression with all four main effects
-and all six pairwise interactions. Levels are not assumed to have a linear dose
-response. Alpha is selected by grouped cross-validation and missing-cell intervals
-come from bootstrap refits. Three- and four-way interactions are intentionally not
-fit because sparse grids generally cannot identify them.
-
-When scikit-learn is available, an ExtraTrees surrogate is used as a nonlinear
-sensitivity check. Missing-cell run suggestions are emitted only if all four Ridge
-models meet the configured grouped-CV R-squared threshold and every suggested cell
-has observed support for all six parameter pairs.
-
-`forget_quality` is modeled on a clipped logit scale solely as a response variable;
-its scientific interpretation remains a KS-test p-value. Model validation describes
-predictive adequacy, not causal identification.
-
-## Main outputs
-
-- `report.html`: filters, interactive observed scatter, audit summary, figures
-- `tables/observed_configurations.csv`: replicate-aggregated observed results
-- `tables/observed_pareto.csv`: observed four-metric Pareto set
-- `tables/missing_combinations.csv`: planned but unavailable cells
-- `tables/predicted_candidates.csv`: validation proposals, possibly empty by design
-- `tables/adjusted_main_effects.csv`: estimated marginal means and intervals
-- `tables/interaction_strengths.csv`: pairwise interaction RMS summaries
-- `coverage_audit.json`, `model_diagnostics.json`, `provenance.json`
-
-## Practical interpretation
-
-The first row of the observed recommendation is the Pareto configuration with the
-strongest replicate support and smallest mean across-seed metric range, followed
-by its worst and mean metric percentiles. When no configuration has replicated
-seeds, the scale-free percentile tie-breaker is used directly. These rules remain
-secondary to constraints and Pareto membership. Set
-scientifically meaningful thresholds in `configs/analysis/palu_hparams.yaml` before
-using the result as an experiment-selection rule.
+By default the report uses only the largest identical protocol cohort. Its
+fingerprint includes model, split, trainer, attention implementation, dtype,
+effective batch, loss settings, classifier settings, and generation settings.
+This prevents results from different models or evaluation protocols from being
+silently combined.

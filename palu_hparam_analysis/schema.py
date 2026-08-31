@@ -5,7 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional, Union
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 FACTORS = ("lr", "alpha", "top_k", "first_n")
 METRICS = (
@@ -66,14 +66,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "exact_memorization_tolerance": None,
         },
     },
-    "modeling": {
-        "min_rows": 16,
-        "cv_folds": 5,
-        "ridge_alphas": [0.01, 0.1, 1.0, 10.0, 100.0],
-        "bootstrap_samples": 100,
-        "random_seed": 20260831,
-        "min_cv_r2_for_candidates": 0.0,
-        "max_predicted_candidates": 30,
+    "recommendation": {
+        "max_promising_levels": 2,
+        "promising_score_tolerance": 0.10,
+        "top_observed_sources": 3,
+        "max_next_experiments": 8,
     },
     "output": {"static_formats": ["png", "pdf", "svg"], "dpi": 300},
 }

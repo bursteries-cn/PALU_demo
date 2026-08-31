@@ -12,8 +12,8 @@ from .schema import load_analysis_config
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Audit and visualize sparse PALU hyperparameter experiments, then rank "
-            "observed Pareto configurations and (when validated) propose missing cells."
+            "Record sparse PALU hyperparameter experiments, summarize promising "
+            "observed values, and propose a few untested one-step neighbors."
         )
     )
     parser.add_argument("--root", default="saves/unlearn", help="result tree to scan")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from statistics import mean, pstdev
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 from .schema import FACTORS, METRICS, METRIC_OBJECTIVES, factor_key
 
@@ -110,18 +110,21 @@ def passes_constraints(
 
 
 def pareto_front(
-    rows: Iterable[dict[str, Any]], em_target: Optional[float], metric_suffix: str = ""
+    rows: Iterable[dict[str, Any]],
+    em_target: Optional[float],
+    metric_suffix: str = "",
+    metrics: Sequence[str] = METRICS,
 ) -> list[dict[str, Any]]:
     complete = []
     for row in rows:
-        values = [row.get(f"{metric}{metric_suffix}") for metric in METRICS]
+        values = [row.get(f"{metric}{metric_suffix}") for metric in metrics]
         if all(value is not None and math.isfinite(float(value)) for value in values):
             complete.append(row)
     front = []
     for candidate in complete:
         candidate_values = [
             objective_value(metric, float(candidate[f"{metric}{metric_suffix}"]), em_target)
-            for metric in METRICS
+            for metric in metrics
         ]
         dominated = False
         for other in complete:
@@ -129,7 +132,7 @@ def pareto_front(
                 continue
             other_values = [
                 objective_value(metric, float(other[f"{metric}{metric_suffix}"]), em_target)
-                for metric in METRICS
+                for metric in metrics
             ]
             if all(right >= left for left, right in zip(candidate_values, other_values)) and any(
                 right > left for left, right in zip(candidate_values, other_values)
@@ -152,30 +155,76 @@ def _percentile_ranks(values: list[float]) -> list[float]:
     return result
 
 
-def add_balanced_ranks(rows: list[dict[str, Any]], em_target: Optional[float]) -> None:
-    complete_indices = [
-        index for index, row in enumerate(rows) if all(row.get(metric) is not None for metric in METRICS)
-    ]
-    if not complete_indices:
-        return
-    metric_ranks: dict[str, list[float]] = {}
-    for metric in METRICS:
+def add_balanced_ranks(
+    rows: list[dict[str, Any]], em_target: Optional[float]
+) -> tuple[str, ...]:
+    """Add conservative relative scores that remain usable with missing metrics.
+
+    A metric participates when it is available for at least half of the observed
+    configurations and at least two rows. Missing participating metrics receive
+    zero credit, so incomplete rows cannot look better merely by omitting a weak
+    result. Scores are descriptive percentiles within the current experiment set.
+    """
+    if not rows:
+        return ()
+    minimum_count = max(2, math.ceil(len(rows) * 0.5))
+    active_metrics = tuple(
+        metric
+        for metric in METRICS
+        if sum(
+            row.get(metric) is not None and math.isfinite(float(row[metric]))
+            for row in rows
+        )
+        >= minimum_count
+    )
+    metric_ranks: dict[str, dict[int, float]] = {}
+    for metric in active_metrics:
+        indices = [
+            index
+            for index, row in enumerate(rows)
+            if row.get(metric) is not None and math.isfinite(float(row[metric]))
+        ]
         values = [
             objective_value(metric, float(rows[index][metric]), em_target)
-            for index in complete_indices
+            for index in indices
         ]
-        metric_ranks[metric] = _percentile_ranks(values)
-    for local_index, row_index in enumerate(complete_indices):
-        ranks = [metric_ranks[metric][local_index] for metric in METRICS]
-        rows[row_index]["balanced_min_percentile"] = min(ranks)
-        rows[row_index]["balanced_mean_percentile"] = mean(ranks)
+        metric_ranks[metric] = dict(zip(indices, _percentile_ranks(values)))
+    for row_index, row in enumerate(rows):
+        available = [
+            metric_ranks[metric][row_index]
+            for metric in active_metrics
+            if row_index in metric_ranks[metric]
+        ]
+        if not active_metrics or not available:
+            row["observed_score"] = None
+            row["balanced_mean_percentile"] = None
+            row["balanced_min_percentile"] = None
+        else:
+            conservative = [
+                metric_ranks[metric].get(row_index, 0.0) for metric in active_metrics
+            ]
+            row["observed_score"] = mean(conservative)
+            row["balanced_mean_percentile"] = row["observed_score"]
+            row["balanced_min_percentile"] = min(conservative)
+        row["score_metrics_used"] = len(available)
+        row["score_metrics_expected"] = len(active_metrics)
+        row["score_metric_names"] = list(active_metrics)
+    return active_metrics
 
 
 def rank_observed(
     rows: list[dict[str, Any]], config: dict[str, Any], em_target: Optional[float]
 ) -> list[dict[str, Any]]:
+    active_metrics = add_balanced_ranks(rows, em_target)
     eligible = [row for row in rows if passes_constraints(row, config, em_target)]
-    front_ids = {id(row) for row in pareto_front(eligible, em_target)}
+    comparable = [
+        row
+        for row in eligible
+        if active_metrics and all(row.get(metric) is not None for metric in active_metrics)
+    ]
+    front_ids = {
+        id(row) for row in pareto_front(comparable, em_target, metrics=active_metrics)
+    }
     for row in rows:
         row["passes_constraints"] = row in eligible
         row["pareto_observed"] = id(row) in front_ids
@@ -188,17 +237,25 @@ def rank_observed(
         ]
         row["replicate_supported"] = len(ranges) == len(METRICS)
         row["mean_metric_replicate_range"] = mean(ranges) if ranges else None
-    add_balanced_ranks(rows, em_target)
     return sorted(
         rows,
         key=lambda row: (
             not row.get("passes_constraints", False),
+            -int(row.get("score_metrics_used", 0)),
+            -(
+                float(row["observed_score"])
+                if row.get("observed_score") is not None
+                else -1.0
+            ),
+            -(
+                float(row["balanced_min_percentile"])
+                if row.get("balanced_min_percentile") is not None
+                else -1.0
+            ),
             not row.get("pareto_observed", False),
             not row.get("replicate_supported", False),
             float(row["mean_metric_replicate_range"])
             if row.get("mean_metric_replicate_range") is not None
             else math.inf,
-            -float(row.get("balanced_min_percentile", -1)),
-            -float(row.get("balanced_mean_percentile", -1)),
         ),
     )

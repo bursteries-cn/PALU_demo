@@ -9,12 +9,17 @@ from pathlib import Path
 
 from palu_hparam_analysis.coverage import coverage_audit
 from palu_hparam_analysis.effects import fit_metric_model
+from palu_hparam_analysis.guidance import (
+    build_experiment_ledger,
+    build_factor_value_summary,
+    recommend_neighbor_experiments,
+)
 from palu_hparam_analysis.ingest import (
     collect_records,
     select_checkpoints,
     select_protocol_cohort,
 )
-from palu_hparam_analysis.pareto import pareto_front
+from palu_hparam_analysis.pareto import pareto_front, rank_observed
 from palu_hparam_analysis.report import run_analysis
 from palu_hparam_analysis.schema import DEFAULT_CONFIG, FACTORS
 
@@ -40,16 +45,15 @@ def synthetic_config() -> dict:
         "overrides": {},
     }
     config["ranking"]["exact_memorization_target"] = 0.6
-    config["modeling"].update(
-        {
-            "min_rows": 8,
-            "cv_folds": 4,
-            "bootstrap_samples": 5,
-            "ridge_alphas": [0.01, 0.1, 1.0],
-            "min_cv_r2_for_candidates": -1.0,
-            "random_seed": 7,
-        }
-    )
+    config["modeling"] = {
+        "min_rows": 8,
+        "cv_folds": 4,
+        "bootstrap_samples": 5,
+        "ridge_alphas": [0.01, 0.1, 1.0],
+        "min_cv_r2_for_candidates": -1.0,
+        "max_predicted_candidates": 30,
+        "random_seed": 7,
+    }
     config["output"] = {"static_formats": ["png"], "dpi": 90}
     return config
 
@@ -219,6 +223,90 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(set(result["main_effects"]), set(FACTORS))
         self.assertEqual(len(result["pair_effects"]), 6)
 
+    def test_partial_metrics_still_produce_observed_guidance(self):
+        rows = self._rows()[:4]
+        for row in rows:
+            row["exact_memorization"] = None
+            for metric in (
+                "model_utility",
+                "forget_quality",
+                "forget_Q_A_gibberish",
+                "exact_memorization",
+            ):
+                row[f"{metric}_n"] = int(row.get(metric) is not None)
+                row[f"{metric}_min"] = row.get(metric)
+                row[f"{metric}_max"] = row.get(metric)
+        ranked = rank_observed(rows, synthetic_config(), em_target=None)
+        self.assertTrue(all(row["observed_score"] is not None for row in ranked))
+        self.assertTrue(all(row["score_metrics_expected"] == 3 for row in ranked))
+        summary, recommendations = build_factor_value_summary(
+            ranked, synthetic_config()
+        )
+        self.assertTrue(any(entry["score_median"] is not None for entry in summary))
+        self.assertEqual(len(recommendations), 4)
+
+    def test_single_configuration_does_not_claim_a_promising_region(self):
+        row = self._rows()[0]
+        for metric in (
+            "model_utility",
+            "forget_quality",
+            "forget_Q_A_gibberish",
+            "exact_memorization",
+        ):
+            row[f"{metric}_n"] = 1
+            row[f"{metric}_min"] = row[metric]
+            row[f"{metric}_max"] = row[metric]
+        ranked = rank_observed([row], synthetic_config(), em_target=0.6)
+        self.assertIsNone(ranked[0]["observed_score"])
+        _, recommendations = build_factor_value_summary(
+            ranked, synthetic_config()
+        )
+        self.assertTrue(
+            all(not item["promising_values"] for item in recommendations)
+        )
+
+    def test_ledger_distinguishes_tested_other_checkpoint_and_missing(self):
+        observed = [self._rows()[0]]
+        other = {
+            **self._rows()[1],
+            "run_id": "other-run",
+            "epoch": 5.0,
+        }
+        ledger = build_experiment_ledger(observed, synthetic_config(), [other])
+        statuses = [row["status"] for row in ledger]
+        self.assertEqual(statuses.count("tested"), 1)
+        self.assertEqual(statuses.count("other_checkpoint"), 1)
+        self.assertEqual(statuses.count("missing"), 14)
+
+    def test_neighbor_suggestions_do_not_require_full_grid_model(self):
+        rows = self._rows()[:5]
+        for row in rows:
+            for metric in (
+                "model_utility",
+                "forget_quality",
+                "forget_Q_A_gibberish",
+                "exact_memorization",
+            ):
+                row[f"{metric}_n"] = 1
+                row[f"{metric}_min"] = row[metric]
+                row[f"{metric}_max"] = row[metric]
+        ranked = rank_observed(rows, synthetic_config(), em_target=0.6)
+        ledger = build_experiment_ledger(ranked, synthetic_config())
+        suggestions = recommend_neighbor_experiments(
+            ranked, ledger, synthetic_config()
+        )
+        self.assertTrue(suggestions)
+        self.assertTrue(all(row["reason"].startswith("one-step neighbor") for row in suggestions))
+        observed_keys = {
+            tuple(str(row[factor]) for factor in FACTORS) for row in ranked
+        }
+        self.assertTrue(
+            all(
+                tuple(str(row[factor]) for factor in FACTORS) not in observed_keys
+                for row in suggestions
+            )
+        )
+
 
 class EndToEndTests(unittest.TestCase):
     def test_report_generation_with_incomplete_grid(self):
@@ -227,27 +315,48 @@ class EndToEndTests(unittest.TestCase):
             root = repo / "saves" / "unlearn"
             combinations = list(
                 itertools.product([1e-5, 2e-5], [0.5, 1.0], [1, 1000], [1, 3])
-            )[:-1]
+            )[:5]
             for lr, alpha, top_k, first_n in combinations:
+                metrics = synthetic_metric_values(lr, alpha, top_k, first_n)
+                metrics.pop("exact_memorization")
                 make_run(
                     root,
                     lr,
                     alpha,
                     top_k,
                     first_n,
-                    synthetic_metric_values(lr, alpha, top_k, first_n),
+                    metrics,
                 )
             output = repo / "report"
             manifest = run_analysis(root, synthetic_config(), output, repo)
             self.assertTrue((output / "report.html").is_file())
-            self.assertTrue((output / "figures" / "coverage.png").is_file())
+            self.assertTrue((output / "figures" / "parameter_guidance.png").is_file())
             self.assertTrue((output / "tables" / "observed_configurations.csv").is_file())
-            self.assertEqual(manifest["counts"]["observed_configurations"], 15)
+            self.assertTrue((output / "tables" / "experiment_ledger.csv").is_file())
+            self.assertTrue((output / "tables" / "recommended_next_experiments.csv").is_file())
+            self.assertEqual(manifest["counts"]["observed_configurations"], 5)
             report = (output / "report.html").read_text(encoding="utf-8")
-            self.assertIn("PALU sparse four-factor analysis", report)
-            self.assertIn("Predicted candidates are proposals", report)
+            self.assertIn("PALU 稀疏超参数实验记录与取值指引", report)
+            self.assertIn("实验台账：已做与未做", report)
+            self.assertIn("只列出当前高分配置", report)
             self.assertNotIn("https://", report)
             self.assertNotIn("http://", report)
+
+    def test_empty_data_report_has_no_empty_figure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            output = repo / "empty-report"
+            manifest = run_analysis(
+                repo / "missing-results", synthetic_config(), output, repo
+            )
+            self.assertEqual(manifest["counts"]["observed_configurations"], 0)
+            self.assertFalse((output / "figures" / "parameter_guidance.png").exists())
+            report = (output / "report.html").read_text(encoding="utf-8")
+            self.assertIn("没有可用于比较的实验结果", report)
+            ledger = (output / "tables" / "experiment_ledger.csv").read_text(
+                encoding="utf-8-sig"
+            )
+            self.assertEqual(ledger.count("\n"), 17)
 
 
 if __name__ == "__main__":
