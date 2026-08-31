@@ -1,0 +1,48 @@
+{
+  "search_space": {
+    "lr": [1e-5, 2e-5, 3e-5, 4e-5, 5e-5],
+    "alpha": [0.2, 0.5, 1.0, 2.0, 5.0],
+    "top_k": [1, 1000, 5000, 10000],
+    "first_n": [1, 2, 3, 4, 5, 10]
+  },
+  "filters": {
+    "model": "Llama-3.1-8B-Instruct",
+    "split": "forget05",
+    "trainer_contains": "PALU",
+    "date": null
+  },
+  "checkpoint": {
+    "policy": "epoch",
+    "epoch": 10
+  },
+  "protocol": {
+    "allow_mixed": false
+  },
+  "baselines": {
+    "full_summary": "saves/eval/tofu_Llama-3.1-8B-Instruct_full/evals_forget05/TOFU_SUMMARY.json",
+    "retain_summary": "saves/eval/tofu_Llama-3.1-8B-Instruct_retain95/TOFU_SUMMARY.json",
+    "overrides": {}
+  },
+  "ranking": {
+    "exact_memorization_target": null,
+    "constraints": {
+      "model_utility_min": null,
+      "forget_quality_min": null,
+      "forget_Q_A_gibberish_min": null,
+      "exact_memorization_tolerance": null
+    }
+  },
+  "modeling": {
+    "min_rows": 16,
+    "cv_folds": 5,
+    "ridge_alphas": [0.01, 0.1, 1.0, 10.0, 100.0],
+    "bootstrap_samples": 100,
+    "random_seed": 20260831,
+    "min_cv_r2_for_candidates": 0.0,
+    "max_predicted_candidates": 30
+  },
+  "output": {
+    "static_formats": ["png", "pdf", "svg"],
+    "dpi": 300
+  }
+}
