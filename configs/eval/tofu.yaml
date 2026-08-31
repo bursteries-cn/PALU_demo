@@ -6,6 +6,7 @@ defaults: # include all defined metrics files
       - model_utility # populated in the metrics key as metrics.model_utility; hm aggregate of 9 metrics
       - forget_quality # KS(Truth_Ratio(f_target, D_f), Truth_Ratio(f_retain, D_f))
       - forget_Q_A_gibberish
+      - exact_memorization
 
 handler: TOFUEvaluator
 output_dir: ${paths.output_dir} # set to default eval directory

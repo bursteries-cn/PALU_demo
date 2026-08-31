@@ -1,5 +1,7 @@
 DATE=$(date "+%m%d")
 TIME=$(date "+%H%M%S")
+# 结果目录里的日期层，整个 sweep 共用脚本启动时的日期
+DATE_DIR=$(date "+%Y-%m-%d")
 
 
 export CUDA_VISIBLE_DEVICES=0,
@@ -19,8 +21,8 @@ splits=(
 lr_set=("2e-5")
 bz_set=("8 4")
 target_mode_set=("mean")
-alpha_set=(1 2 5)
-topk_set=(5000)
+alpha_set=(0.2)
+topk_set=(1000)
 first_n_set=(3)
 epoch_set=(10)
 
@@ -43,7 +45,7 @@ for split in "${splits[@]}"; do
                                 # learning_rate, batchsize, grad_acc, epochs
                                 SUFFIX="target_mode${target_mode}_first_n${first_n}_lr${lr}_b${bsz}_ga${grad_acc}_a${alpha}_topk${topk}_e${epochs}_day${DATE}_time${TIME}"
                                 TASK_NAME="unlearn_tofu_${MODEL}_${forget_split}_${TRAINER}_${SUFFIX}"
-                                OUTPUT_DIR="./saves/unlearn/tofu/${forget_split}/${MODEL}/${TRAINER}_acl/${SUFFIX}"
+                                OUTPUT_DIR="./saves/unlearn/tofu/${forget_split}/${MODEL}/${DATE_DIR}/${TRAINER}_acl/${SUFFIX}"
 
                                 # TRAIN COMMAND =================================
                                 export WANDB_PROJECT=${WANDB_PROJECT}

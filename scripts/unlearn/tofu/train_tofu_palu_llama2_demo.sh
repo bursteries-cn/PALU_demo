@@ -4,28 +4,28 @@ TIME=$(date "+%H%M%S")
 DATE_DIR=$(date "+%Y-%m-%d")
 
 
-export CUDA_VISIBLE_DEVICES=1,
-MODEL="Llama-3.1-8B-Instruct"
+export CUDA_VISIBLE_DEVICES=2,
+MODEL="Llama-2-7b-chat-hf" 
 
 REPORTTO="wandb"
 WANDB_PROJECT="anonymous_code_unlearning"
 DO_SAVE="true"
 
 TRAINER="PALU"
-PRETRAINED_PATH="open-unlearning/tofu_Llama-3.1-8B-Instruct_full"
+PRETRAINED_PATH="open-unlearning/tofu_Llama-2-7b-chat-hf_full"
 
 splits=(
     "forget05 holdout05 retain95"
-    "forget01 holdout01 retain99"
-    "forget10 holdout10 retain90"
+    # "forget01 holdout01 retain99"
+    # "forget10 holdout10 retain90"
 )
 # lr, batchsize, grad_acc, epochs
-lr_set=("1e-5" "2e-5" "3e-5" "4e-5" "5e-5")
+lr_set=("2e-5")
 bz_set=("8 4")
 target_mode_set=("mean")
-alpha_set=(1 2 5 0.5 0.2)
-topk_set=(1 1000 5000 10000)
-first_n_set=(1 2 3 4 5 10)
+alpha_set=(0.2)
+topk_set=(5000)
+first_n_set=(3)
 epoch_set=(10)
 
 for split in "${splits[@]}"; do
