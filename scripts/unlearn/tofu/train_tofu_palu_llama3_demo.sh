@@ -18,11 +18,11 @@ splits=(
     "forget05 holdout05 retain95"
 )
 # lr, batchsize, grad_acc, epochs
-lr_set=("2e-5")
+lr_set=("3e-5")
 bz_set=("8 4")
 target_mode_set=("mean")
 alpha_set=(0.2)
-topk_set=(1000)
+topk_set=(1000 5000 10000)
 first_n_set=(3)
 epoch_set=(10)
 

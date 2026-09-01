@@ -1,6 +1,7 @@
 # Modified from https://github.com/huggingface/transformers/blob/v4.45.1/src/transformers/trainer.py
 
 import logging
+import math
 import os
 from typing import Any, Dict, List, Optional, Union
 
@@ -9,6 +10,19 @@ from transformers import Trainer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
 logger = logging.getLogger(__name__)
+
+# KS p-values can underflow to exactly 0; floor them so the log stays on a readable scale.
+MIN_PVALUE = 1e-30
+
+
+def add_neg_log_pvalue_metrics(eval_metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Add -log10 versions of p-value metrics, which span too many orders of
+    magnitude to be readable on the linear axes of a logging dashboard."""
+    for name in ("forget_quality",):
+        pvalue = eval_metrics.get(name)
+        if isinstance(pvalue, (int, float)) and not isinstance(pvalue, bool):
+            eval_metrics[f"{name}_neg_log10"] = -math.log10(max(pvalue, MIN_PVALUE))
+    return eval_metrics
 
 
 class FinetuneTrainer(Trainer):
@@ -44,7 +58,7 @@ class FinetuneTrainer(Trainer):
                             "tokenizer": self.tokenizer,
                         }
                         eval_metrics.update(evaluator.evaluate(**eval_args))
-                    self.log(eval_metrics)
+                    self.log(add_neg_log_pvalue_metrics(dict(eval_metrics)))
                 else:
                     logger.warning(
                         "Custom evaluator can be run with this Trainer only when a single accelerator process is running."
