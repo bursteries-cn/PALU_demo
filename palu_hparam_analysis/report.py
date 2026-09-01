@@ -30,7 +30,7 @@ from .pareto import (
     rank_observed,
     resolve_em_target,
 )
-from .plots import plot_parameter_guidance
+from .plots import plot_metric_parameter_grid, plot_parameter_guidance
 from .schema import (
     FACTORS,
     FACTOR_LABELS,
@@ -62,6 +62,7 @@ def _clean_owned_outputs(output_dir: Path) -> None:
         "main_effects_",
         "interactions_",
         "parameter_guidance",
+        "metric_by_parameter_grid",
     )
     if figure_dir.is_dir():
         for path in figure_dir.iterdir():
@@ -226,6 +227,7 @@ def build_html_report(
     baselines: dict[str, Any],
     em_target: Optional[float],
     guidance_image: Optional[str],
+    metric_grid_image: Optional[str],
     warnings: list[str],
     config: dict[str, Any],
     provenance: dict[str, Any],
@@ -255,6 +257,12 @@ def build_html_report(
         f'<img class="guidance" src="{html.escape(guidance_image)}" alt="Observed parameter guidance">'
         if guidance_image
         else '<p class="muted">现有指标不足，暂不绘制取值趋势图，避免产生空图。</p>'
+    )
+    metric_grid_html = (
+        f'<a href="{html.escape(metric_grid_image)}" target="_blank" rel="noopener" title="点击打开原始分辨率">'
+        f'<img class="guidance" src="{html.escape(metric_grid_image)}" alt="Four by four raw metric and hyperparameter grid"></a>'
+        if metric_grid_image
+        else '<p class="muted">当前没有可绘制的原始指标值。</p>'
     )
     html_text = f"""<!doctype html>
 <html lang="zh-CN">
@@ -313,6 +321,14 @@ code {{ background:#eef2f5; padding:2px 5px; border-radius:4px; }}
   <div class="tableWrap"><table><thead><tr><th>参数</th><th>当前较有希望的取值</th><th>最佳中位分数</th><th>支持配置数</th><th>证据量</th></tr></thead><tbody>{_promising_table(factor_recommendations)}</tbody></table></div>
   {image_html}
   <p class="note">这是稀疏、非平衡实验下的描述性定位，用来缩小下一轮搜索范围；不能解释为单个参数的因果效应。</p>
+</section>
+
+<section>
+  <h2>四个超参数 × 四个原始指标</h2>
+  <p>列依次为 <code>lr</code>、<code>alpha</code>、<code>top_k</code>、<code>first_n</code>，行依次为 MU、FQ、Fluency 和 EM。蓝点是单个已实验配置，橙色折线是各取值中位数，误差线是 25%–75% 四分位区间。</p>
+  {metric_grid_html}
+  <p class="note">点击图片可在新标签页打开原始分辨率；同目录还会保存 PDF 和 SVG（取决于输出配置）。</p>
+  <p class="note">纵轴均为对应指标的原始值，不是综合百分位。折线仅帮助观察离散取值趋势，不表示连续函数或因果效应；缺失取值不会被插补。</p>
 </section>
 
 <section>
@@ -496,6 +512,18 @@ def run_analysis(
         if path.suffix.lower() == ".png":
             guidance_image = path.relative_to(output_dir).as_posix()
             break
+    metric_grid_paths = plot_metric_parameter_grid(
+        observed,
+        em_target,
+        figures_dir / "metric_by_parameter_grid",
+        config,
+    )
+    metric_grid_image = None
+    for raw_path in metric_grid_paths:
+        path = Path(raw_path)
+        if path.suffix.lower() == ".png":
+            metric_grid_image = path.relative_to(output_dir).as_posix()
+            break
     build_html_report(
         output_dir / "report.html",
         observed,
@@ -507,6 +535,7 @@ def run_analysis(
         baselines,
         em_target,
         guidance_image,
+        metric_grid_image,
         warnings,
         config,
         provenance,

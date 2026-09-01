@@ -331,6 +331,9 @@ class EndToEndTests(unittest.TestCase):
             manifest = run_analysis(root, synthetic_config(), output, repo)
             self.assertTrue((output / "report.html").is_file())
             self.assertTrue((output / "figures" / "parameter_guidance.png").is_file())
+            self.assertTrue(
+                (output / "figures" / "metric_by_parameter_grid.png").is_file()
+            )
             self.assertTrue((output / "tables" / "observed_configurations.csv").is_file())
             self.assertTrue((output / "tables" / "experiment_ledger.csv").is_file())
             self.assertTrue((output / "tables" / "recommended_next_experiments.csv").is_file())
@@ -351,6 +354,9 @@ class EndToEndTests(unittest.TestCase):
             )
             self.assertEqual(manifest["counts"]["observed_configurations"], 0)
             self.assertFalse((output / "figures" / "parameter_guidance.png").exists())
+            self.assertFalse(
+                (output / "figures" / "metric_by_parameter_grid.png").exists()
+            )
             report = (output / "report.html").read_text(encoding="utf-8")
             self.assertIn("没有可用于比较的实验结果", report)
             ledger = (output / "tables" / "experiment_ledger.csv").read_text(

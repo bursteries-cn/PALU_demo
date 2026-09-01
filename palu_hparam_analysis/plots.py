@@ -17,7 +17,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
 
-from .schema import FACTORS, FACTOR_LABELS, METRICS, METRIC_LABELS, display_factor_value
+from .coverage import normalized_search_space
+from .schema import (
+    FACTORS,
+    FACTOR_LABELS,
+    METRICS,
+    METRIC_LABELS,
+    canonical_factor_value,
+    display_factor_value,
+)
 
 OKABE_ITO = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9", "#000000"]
 
@@ -194,6 +202,180 @@ def plot_parameter_guidance(
         "Observed parameter guidance (median and IQR; orange bands mark current promising levels)\n"
         "Descriptive under sparse, confounded coverage — not a causal effect estimate",
         fontsize=10,
+    )
+    return save_figure(
+        fig,
+        output_stem,
+        config["output"]["static_formats"],
+        int(config["output"]["dpi"]),
+    )
+
+
+def plot_metric_parameter_grid(
+    rows: list[dict[str, Any]],
+    em_target: Optional[float],
+    output_stem: Path,
+    config: dict[str, Any],
+) -> list[str]:
+    """Plot raw observations and per-level medians for every metric-factor pair."""
+    has_values = any(
+        row.get(metric) is not None
+        and math.isfinite(float(row[metric]))
+        for row in rows
+        for metric in METRICS
+    )
+    if not has_values:
+        return []
+
+    apply_publication_style()
+    configured_levels = normalized_search_space(config)
+    factor_levels: dict[str, list[Any]] = {}
+    for factor in FACTORS:
+        levels = list(configured_levels[factor])
+        for row in rows:
+            value = canonical_factor_value(factor, row.get(factor))
+            if value is not None and value not in levels:
+                levels.append(value)
+        factor_levels[factor] = levels
+
+    fig, axes = plt.subplots(
+        len(METRICS),
+        len(FACTORS),
+        figsize=(13.2, 11.0),
+        sharey="row",
+        constrained_layout=False,
+    )
+    for metric_index, metric in enumerate(METRICS):
+        for factor_index, factor in enumerate(FACTORS):
+            ax = axes[metric_index, factor_index]
+            levels = factor_levels[factor]
+            x = np.arange(len(levels), dtype=float)
+            medians = np.full(len(levels), np.nan, dtype=float)
+            q25 = np.full(len(levels), np.nan, dtype=float)
+            q75 = np.full(len(levels), np.nan, dtype=float)
+            for level_index, level in enumerate(levels):
+                values = [
+                    float(row[metric])
+                    for row in rows
+                    if canonical_factor_value(factor, row.get(factor)) == level
+                    and row.get(metric) is not None
+                    and math.isfinite(float(row[metric]))
+                ]
+                if not values:
+                    continue
+                array = np.asarray(values, dtype=float)
+                medians[level_index] = float(np.median(array))
+                q25[level_index] = float(np.percentile(array, 25))
+                q75[level_index] = float(np.percentile(array, 75))
+                jitter = (
+                    np.asarray([-0.07])
+                    if len(array) == 1
+                    else np.linspace(-0.13, 0.13, len(array), dtype=float) + 0.018
+                )
+                ax.scatter(
+                    np.full(len(array), level_index, dtype=float) + jitter,
+                    array,
+                    s=18,
+                    color=OKABE_ITO[0],
+                    alpha=0.62,
+                    edgecolors="white",
+                    linewidths=0.35,
+                    zorder=5,
+                )
+                ax.annotate(
+                    f"n={len(array)}",
+                    (level_index, medians[level_index]),
+                    xytext=(0, 7),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=5.5,
+                    color="#4f5b66",
+                )
+            tested = np.isfinite(medians)
+            if np.any(tested):
+                ax.plot(
+                    x,
+                    medians,
+                    color=OKABE_ITO[1],
+                    marker="o",
+                    markersize=4.2,
+                    linewidth=1.35,
+                    zorder=4,
+                )
+                ax.errorbar(
+                    x[tested],
+                    medians[tested],
+                    yerr=np.vstack(
+                        [
+                            medians[tested] - q25[tested],
+                            q75[tested] - medians[tested],
+                        ]
+                    ),
+                    fmt="none",
+                    ecolor=OKABE_ITO[1],
+                    elinewidth=1.0,
+                    capsize=2.5,
+                    zorder=3,
+                )
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No observed values",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                    color="#74808b",
+                    fontsize=7,
+                )
+            if metric == "exact_memorization" and em_target is not None:
+                ax.axhline(
+                    float(em_target),
+                    color="#555555",
+                    linestyle="--",
+                    linewidth=0.8,
+                    alpha=0.8,
+                    zorder=1,
+                )
+            ax.set_xticks(x)
+            ax.set_xticklabels(
+                [display_factor_value(factor, level) for level in levels],
+                rotation=32,
+                ha="right",
+            )
+            if metric_index == 0:
+                ax.set_title(FACTOR_LABELS[factor], fontweight="bold", pad=7)
+            if metric_index == len(METRICS) - 1:
+                ax.set_xlabel(FACTOR_LABELS[factor])
+            if factor_index == 0:
+                ax.set_ylabel(METRIC_LABELS[metric])
+            panel = metric_index * len(FACTORS) + factor_index
+            ax.text(
+                0.01,
+                0.98,
+                chr(65 + panel),
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8,
+                fontweight="bold",
+            )
+            ax.grid(axis="y", color="#e4e8ec", linewidth=0.55)
+
+    fig.subplots_adjust(
+        left=0.078,
+        right=0.995,
+        bottom=0.065,
+        top=0.90,
+        hspace=0.30,
+        wspace=0.08,
+    )
+    fig.suptitle(
+        "Raw metric observations by hyperparameter\n"
+        "Blue = observed configurations; orange = median and IQR; lines break at unobserved levels",
+        fontsize=11,
+        y=0.975,
     )
     return save_figure(
         fig,

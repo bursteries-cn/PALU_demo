@@ -40,6 +40,12 @@ model-specific analysis config.
 5. Which small set of one-parameter neighboring experiments would most directly
    refine the current promising region?
 
+The report also includes a 4-by-4 raw-value figure: columns are the four
+hyperparameters and rows are the four metrics. Blue points are individual
+observed configurations; the orange line connects per-level medians across
+adjacent observed levels, with interquartile-range error bars. Missing levels are
+not imputed, and a completely unavailable metric is labeled explicitly.
+
 The compact guidance score is the equal-weight mean of direction-aligned metric
 percentiles within the current observed set. A metric participates when it has at
 least two observations and is available for at least half of the configurations.
@@ -56,6 +62,8 @@ a warning.
 
 - `report.html`: compact guidance, value summaries, next local probes, and a
   filterable experiment ledger
+- `figures/metric_by_parameter_grid.*`: 16 raw metric-by-parameter scatter and
+  median-line panels
 - `tables/experiment_ledger.csv`: one row per planned combination with status
   `tested`, `other_checkpoint`, or `missing`
 - `tables/observed_configurations.csv`: observed metrics aggregated by parameter
