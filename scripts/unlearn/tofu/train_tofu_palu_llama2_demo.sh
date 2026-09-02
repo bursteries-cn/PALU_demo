@@ -12,7 +12,7 @@ MODEL="Llama-2-7b-chat-hf"
 
 REPORTTO="wandb"
 WANDB_PROJECT="anonymous_code_unlearning"
-DO_SAVE="true"
+DO_SAVE="false"
 
 TRAINER="PALU"
 PRETRAINED_PATH="open-unlearning/tofu_Llama-2-7b-chat-hf_full"
