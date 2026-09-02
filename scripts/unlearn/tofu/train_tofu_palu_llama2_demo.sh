@@ -1,10 +1,13 @@
+#!/bin/bash
+set -e
+
 DATE=$(date "+%m%d")
 TIME=$(date "+%H%M%S")
 # 结果目录里的日期层，整个 sweep 共用脚本启动时的日期
 DATE_DIR=$(date "+%Y-%m-%d")
 
 
-export CUDA_VISIBLE_DEVICES=2,
+GPU="2,"
 MODEL="Llama-2-7b-chat-hf" 
 
 REPORTTO="wandb"
@@ -20,13 +23,55 @@ splits=(
     # "forget10 holdout10 retain90"
 )
 # lr, batchsize, grad_acc, epochs
-lr_set=("2e-5")
+# 以下为默认值，可通过命令行参数覆盖
+lr_set=("5e-5")
 bz_set=("8 4")
 target_mode_set=("mean")
 alpha_set=(0.2)
 topk_set=(5000)
-first_n_set=(3)
+first_n_set=(2 3 5)
 epoch_set=(10)
+
+usage() {
+    cat <<EOF
+用法: $0 [选项]
+
+  --lr       "<v1 v2 ...>"   学习率           (默认: ${lr_set[*]})
+  --alpha    "<v1 v2 ...>"   alpha            (默认: ${alpha_set[*]})
+  --topk     "<v1 v2 ...>"   top_k            (默认: ${topk_set[*]})
+  --first_n  "<v1 v2 ...>"   first_n          (默认: ${first_n_set[*]})
+  --gpu      <ids>           CUDA_VISIBLE_DEVICES (默认: ${GPU})
+  -h, --help                 显示本帮助
+
+除 --gpu 外，每个选项都可以传入用空格分隔的多个值来做 sweep，例如:
+  $0 --gpu 0,1 --lr "1e-5 5e-5" --alpha 0.2 --topk 5000 --first_n "2 3 5"
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --lr)       read -r -a lr_set      <<< "$2"; shift 2 ;;
+        --alpha)    read -r -a alpha_set   <<< "$2"; shift 2 ;;
+        --topk)     read -r -a topk_set    <<< "$2"; shift 2 ;;
+        --first_n)  read -r -a first_n_set <<< "$2"; shift 2 ;;
+        --lr=*)      read -r -a lr_set      <<< "${1#*=}"; shift ;;
+        --alpha=*)   read -r -a alpha_set   <<< "${1#*=}"; shift ;;
+        --topk=*)    read -r -a topk_set    <<< "${1#*=}"; shift ;;
+        --first_n=*) read -r -a first_n_set <<< "${1#*=}"; shift ;;
+        --gpu)      GPU="$2"; shift 2 ;;
+        --gpu=*)    GPU="${1#*=}"; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        *)          echo "未知参数: $1"; usage; exit 1 ;;
+    esac
+done
+
+export CUDA_VISIBLE_DEVICES="${GPU}"
+
+echo "CUDA_VISIBLE_DEVICES = ${CUDA_VISIBLE_DEVICES}"
+echo "lr_set      = ${lr_set[*]}"
+echo "alpha_set   = ${alpha_set[*]}"
+echo "topk_set    = ${topk_set[*]}"
+echo "first_n_set = ${first_n_set[*]}"
 
 for split in "${splits[@]}"; do
     for lr in "${lr_set[@]}"; do
