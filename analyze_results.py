@@ -5,6 +5,7 @@
     python analyze_results.py --topk 20            # 各指标 Top-20
     python analyze_results.py --last-only          # 只看每个 run 的最后一个 checkpoint
     python analyze_results.py --min-utility 0.6    # 先过滤掉 model_utility 太低的
+    python analyze_results.py --model llama-3.1    # 只看某个模型，避免不同模型混排
     python analyze_results.py --csv results.csv    # 导出全部记录
 """
 
@@ -103,6 +104,11 @@ def fmt_params(r):
     )
 
 
+def match_model(r, pattern):
+    """pattern 为 None 时不过滤，否则按大小写不敏感的子串匹配。"""
+    return pattern is None or pattern.lower() in r["model"].lower()
+
+
 def print_table(title, rows, metric, extra_metrics):
     print(f"\n{title}")
     print("-" * 118)
@@ -155,6 +161,11 @@ def main():
     ap.add_argument("--min-utility", type=float, default=None)
     ap.add_argument("--min-forget-quality", type=float, default=None)
     ap.add_argument("--split", default=None, help="只看某个 forget split，如 forget05")
+    ap.add_argument(
+        "--model",
+        default=None,
+        help="只看某个模型，子串匹配且大小写不敏感，如 llama-2 / llama-3.1",
+    )
     ap.add_argument("--date", default=None, help="只看某一天的实验，如 2026-08-30")
     ap.add_argument("--csv", default=None, help="把全部记录导出到 csv")
     args = ap.parse_args()
@@ -168,6 +179,7 @@ def main():
     all_metrics = sorted({m for r in records for m in r["metrics"]})
     print(f"共扫描到 {len(records)} 条评估记录，来自 {len({r['run_dir'] for r in records})} 个 run")
     print(f"指标：{', '.join(all_metrics)}")
+    print(f"模型：{', '.join(sorted({r['model'] for r in records}))}")
     dates = sorted({r["date"] for r in records if r["date"]})
     if dates:
         print(f"日期：{', '.join(dates)}")
@@ -188,7 +200,7 @@ def main():
         print(f"已导出：{args.csv}")
 
     # checkpoint-0 是训练前的原始模型，作为参考基线单独打印
-    baselines = [r for r in records if r["step"] == 0]
+    baselines = [r for r in records if r["step"] == 0 and match_model(r, args.model)]
     if baselines:
         print("\n训练前基线（checkpoint-0，各 run 应当一致）")
         print("-" * 118)
@@ -200,6 +212,8 @@ def main():
     pool = records
     if args.split:
         pool = [r for r in pool if r["split"] == args.split]
+    if args.model:
+        pool = [r for r in pool if match_model(r, args.model)]
     if args.date:
         pool = [r for r in pool if r["date"] == args.date]
     if not args.include_start:
