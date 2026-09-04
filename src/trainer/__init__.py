@@ -8,6 +8,7 @@ from transformers import Trainer, TrainingArguments
 from trainer.base import FinetuneTrainer
 from trainer.unlearn.grad_ascent import GradAscent
 from trainer.unlearn.grad_diff import GradDiff
+from trainer.unlearn.npo import NPO
 from trainer.unlearn.palu import PALU
 
 logger = logging.getLogger(__name__)
@@ -81,4 +82,5 @@ _register_trainer(FinetuneTrainer)
 # Register Unlearning Trainer
 _register_trainer(GradAscent)
 _register_trainer(GradDiff)
+_register_trainer(NPO)
 _register_trainer(PALU)
