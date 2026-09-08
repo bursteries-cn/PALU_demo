@@ -44,12 +44,20 @@ def compute_batch_nll(model, inputs):
     return loss, outputs
 
 
-def compute_dpo_loss(model, ref_model, win_inputs=None, lose_inputs=None, beta=1.0):
+def compute_dpo_loss(
+    model,
+    ref_model,
+    win_inputs=None,
+    lose_inputs=None,
+    beta=1.0,
+    return_details=False,
+):
     if win_inputs is None and lose_inputs is None:
         raise ValueError("Both win_inputs and lose_inputs can't be None")
 
     win_log_ratio, lose_log_ratio = 0.0, 0.0
     win_outputs, lose_outputs = None, None
+    win_loss, lose_loss = None, None
 
     if win_inputs is not None:
         win_loss, win_outputs = compute_batch_nll(model, win_inputs)
@@ -64,7 +72,20 @@ def compute_dpo_loss(model, ref_model, win_inputs=None, lose_inputs=None, beta=1
         lose_log_ratio = -(lose_loss - lose_ref_loss)
 
     loss = -2 / beta * F.logsigmoid(beta * (win_log_ratio - lose_log_ratio)).mean()
-    return loss, (win_outputs, lose_outputs)
+    outputs = (win_outputs, lose_outputs)
+    if not return_details:
+        return loss, outputs
+    details = {
+        "win_log_ratio": win_log_ratio.detach() if torch.is_tensor(win_log_ratio) else None,
+        "lose_log_ratio": lose_log_ratio.detach() if torch.is_tensor(lose_log_ratio) else None,
+        "win_nll": win_loss.detach() if win_loss is not None else None,
+        "lose_nll": lose_loss.detach() if lose_loss is not None else None,
+    }
+    if torch.is_tensor(lose_log_ratio):
+        details["npo_weight"] = 2.0 * torch.sigmoid(beta * lose_log_ratio.detach())
+    else:
+        details["npo_weight"] = None
+    return loss, outputs, details
 
 
 def compute_undial_loss(model, ref_model, inputs, beta):

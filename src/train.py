@@ -1,6 +1,7 @@
 import os
 from collections.abc import MutableMapping
 from dataclasses import asdict, is_dataclass
+from pathlib import Path
 
 import hydra
 import mlflow
@@ -40,18 +41,26 @@ def main(cfg: DictConfig):
         cfg (DictConfig): Config to train
     """
 
+    if int(os.getenv("RANK", "0")) == 0:
+        output_dir = Path(str(cfg.paths.output_dir))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "resolved_config.yaml").write_text(
+            OmegaConf.to_yaml(cfg, resolve=True),
+            encoding="utf-8",
+        )
+
     wandb_config = {
         **to_plain_dict(cfg),  
     }
 
     wandb_config_flat = flatten(wandb_config)
-    if cfg.trainer.args.report_to == "wandb":
+    if cfg.trainer.args.report_to == "wandb" and int(os.getenv("RANK", "0")) == 0:
         wandb.init(
             project=os.getenv("WANDB_PROJECT", "open-unlearning"),
             name=cfg.task_name,
             config=wandb_config_flat,
         )
-        training(cfg)
+    training(cfg)
 
 
 def training(cfg):

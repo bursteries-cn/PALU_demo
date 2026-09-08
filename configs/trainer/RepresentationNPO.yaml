@@ -1,0 +1,12 @@
+defaults:
+  - NPO
+
+handler: RepresentationNPO
+method_args:
+  batch_manifest_path: ???
+  npo_near_zero_threshold: 0.1
+  verify_feature_hash: true
+  beta: 0.1
+  alpha: 1.0
+  gamma: 1.0
+  retain_loss_type: NLL

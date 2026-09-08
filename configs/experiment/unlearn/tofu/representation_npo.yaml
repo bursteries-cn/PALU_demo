@@ -1,0 +1,55 @@
+# @package _global_
+
+defaults:
+  - override /model: Llama-3.1-8B-Instruct
+  - override /trainer: RepresentationNPO
+  - override /data: unlearn
+  - override /collator: DataCollatorForSupervisedDatasetwithIndex
+  - override /data/datasets@data.forget: TOFU_QA_forget
+  - override /data/datasets@data.retain: TOFU_QA_retain
+
+forget_split: forget05
+retain_split: retain95
+holdout_split: holdout05
+
+data:
+  anchor: forget
+  forget:
+    TOFU_QA_forget:
+      args:
+        hf_args:
+          name: ${forget_split}
+  retain:
+    TOFU_QA_retain:
+      args:
+        hf_args:
+          name: ${retain_split}
+
+trainer:
+  args:
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 10
+    learning_rate: 2e-5
+    weight_decay: 0.01
+    num_train_epochs: 3
+    max_steps: -1
+    warmup_epochs: null
+    warmup_steps: 0
+    lr_scheduler_type: constant
+    optim: adamw_torch
+    bf16: true
+    gradient_checkpointing: true
+    logging_steps: 1
+    dataloader_num_workers: 0
+    dataloader_drop_last: false
+    group_by_length: false
+    ddp_find_unused_parameters: false
+    do_eval: false
+    eval_strategy: "no"
+    save_strategy: "no"
+    save_only_model: true
+    report_to: wandb
+
+eval: null
+do_save: true
+task_name: ???

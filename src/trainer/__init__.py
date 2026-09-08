@@ -10,6 +10,7 @@ from trainer.unlearn.grad_ascent import GradAscent
 from trainer.unlearn.grad_diff import GradDiff
 from trainer.unlearn.npo import NPO
 from trainer.unlearn.palu import PALU
+from trainer.unlearn.representation_npo import RepresentationNPO
 
 logger = logging.getLogger(__name__)
 
@@ -84,3 +85,4 @@ _register_trainer(GradAscent)
 _register_trainer(GradDiff)
 _register_trainer(NPO)
 _register_trainer(PALU)
+_register_trainer(RepresentationNPO)

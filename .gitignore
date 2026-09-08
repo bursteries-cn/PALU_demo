@@ -180,4 +180,5 @@ cython_debug/
 # Local models and training outputs
 /models/
 /saves/unlearn/
+/artifacts/representation_batching/
 /reports/hparam_analysis/
