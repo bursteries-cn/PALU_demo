@@ -18,6 +18,7 @@ from representation_batching.manifest import (  # noqa: E402
     split_step_for_rank,
     write_batch_manifest,
 )
+from representation_batching.local_dataset import resolve_local_dataset_config  # noqa: E402
 
 
 def clustered_features() -> np.ndarray:
@@ -34,6 +35,32 @@ def clustered_features() -> np.ndarray:
         ],
         dtype=np.float32,
     )
+
+
+class LocalDatasetResolutionTests(unittest.TestCase):
+    def test_resolves_hub_style_config_to_local_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_file = root / "forget05.json"
+            data_file.write_text('{"question":"q","answer":"a"}\n', encoding="utf-8")
+            self.assertEqual(
+                resolve_local_dataset_config(str(root), "forget05"),
+                ("json", data_file.resolve()),
+            )
+
+    def test_missing_local_config_falls_back_to_normal_loader(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.assertIsNone(
+                resolve_local_dataset_config(temp, "forget05")
+            )
+
+    def test_ambiguous_local_config_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "forget05.json").touch()
+            (root / "forget05.parquet").touch()
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                resolve_local_dataset_config(str(root), "forget05")
 
 
 class GroupingTests(unittest.TestCase):

@@ -26,6 +26,12 @@ Use the repository's pinned environment (`transformers==4.45.1`,
 license and authenticate on the server with `hf auth login` or a secret
 `HF_TOKEN`. Do not put a token in a script or config file.
 
+For an offline server, copy the complete TOFU repository directory and the Full
+model snapshot to local storage. Passing the absolute TOFU directory through
+`--dataset` selects `<config>.json` directly, so the copied Dataset Card does
+not need to expose Hub `BuilderConfig` metadata. Pass the local model directory
+through `--model`, and omit revision arguments for both local paths.
+
 All commands below run from the repository root. The local laptop is suitable
 for manifest tests but is not expected to load the model.
 

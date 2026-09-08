@@ -12,7 +12,6 @@ from typing import Dict, List, Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
-from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -20,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from representation_batching.manifest import qa_content_sha256  # noqa: E402
+from data.utils import load_hf_dataset  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -209,9 +209,9 @@ def main() -> None:
         model.to(args.device)
     model.eval()
 
-    dataset = load_dataset(
-        args.dataset,
-        args.dataset_config,
+    dataset = load_hf_dataset(
+        path=args.dataset,
+        name=args.dataset_config,
         split=args.dataset_split,
         revision=args.dataset_revision,
     )

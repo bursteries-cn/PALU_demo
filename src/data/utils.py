@@ -4,12 +4,33 @@ import numpy as np
 import logging
 from typing import List, Dict, Any, Union
 
+from representation_batching.local_dataset import resolve_local_dataset_config
+
 IGNORE_INDEX = -100  # TODO put in common constants
 
 logger = logging.getLogger("data")
 
 
 def load_hf_dataset(path, **kwargs):
+    local_config = resolve_local_dataset_config(path, kwargs.get("name"))
+    if local_config is not None:
+        builder, data_file = local_config
+        local_kwargs = dict(kwargs)
+        local_kwargs.pop("name", None)
+        local_kwargs.pop("revision", None)
+        requested_split = local_kwargs.pop("split", "train")
+        dataset = datasets.load_dataset(
+            builder,
+            data_files={"train": str(data_file)},
+            split=requested_split,
+            **local_kwargs,
+        )
+        logger.info(
+            "Loaded local dataset config %s from %s",
+            kwargs.get("name"),
+            data_file,
+        )
+        return dataset
     dataset = datasets.load_dataset(path, **kwargs)
     return dataset
 
