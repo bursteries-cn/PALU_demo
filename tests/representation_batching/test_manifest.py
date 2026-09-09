@@ -139,6 +139,16 @@ class GroupingTests(unittest.TestCase):
             ]
             self.assertEqual(sorted(random_batches), sorted(similar_batches))
 
+    def test_adjacent_cosine_matches_actual_order(self):
+        features = self.features / np.linalg.norm(self.features, axis=1, keepdims=True)
+        steps = self.build("S", batch_order="similar")
+        for epoch in range(2):
+            epoch_steps = [s for s in steps if s["epoch"] == epoch]
+            self.assertIsNone(epoch_steps[0]["previous_batch_cosine"])
+            for previous, current in zip(epoch_steps, epoch_steps[1:]):
+                cross = features[previous["forget_indices"]] @ features[current["forget_indices"]].T
+                self.assertAlmostEqual(current["previous_batch_cosine"], float(cross.mean()))
+
 
 class ManifestRuntimeContractTests(unittest.TestCase):
     def test_round_trip_validation_and_rank_split(self):

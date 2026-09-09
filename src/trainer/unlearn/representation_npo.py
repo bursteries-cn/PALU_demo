@@ -307,8 +307,7 @@ class RepresentationNPO(NPO):
             gathered[key] = self.accelerator.gather(local_values)
         if self.is_world_process_zero():
             weights = gathered["npo_weight"]
-            self.log(
-                {
+            diagnostics = {
                     "manifest_epoch": expected["epoch"],
                     "manifest_optimizer_step": expected["optimizer_step"],
                     "forget_loss": gathered["forget_loss"].mean().item(),
@@ -330,7 +329,14 @@ class RepresentationNPO(NPO):
                         "forget_padding_tokens"
                     ].mean().item(),
                 }
-            )
+            # Persist independently of W&B and save_model, including no-save smoke runs.
+            # Losses describe the incoming update; this is not a completion marker.
+            diagnostics["optimizer_step"] = int(self.state.global_step) + 1
+            with (Path(self.args.output_dir) / "training_diagnostics.jsonl").open(
+                "a", encoding="utf-8"
+            ) as handle:
+                handle.write(json.dumps(diagnostics, ensure_ascii=False) + "\n")
+            self.log(diagnostics)
         self._diagnostic_buffer = {}
 
     def get_train_dataloader(self):
@@ -407,12 +413,36 @@ class RepresentationNPO(NPO):
         return (loss, forget_outputs) if return_outputs else loss
 
     def train(self, *args, **kwargs):
-        output = super().train(*args, **kwargs)
+        def write_status(status, error=None):
+            if self.is_world_process_zero():
+                payload = {
+                    "status": status,
+                    "global_step": int(self.state.global_step),
+                    "max_steps": int(self.args.max_steps),
+                    "observed_microbatches_per_rank": self._observed_microbatch_count,
+                    "expected_microbatches_per_rank": len(self._expected_rank_microbatches),
+                    "error": error,
+                }
+                path = Path(self.args.output_dir) / "training_status.json"
+                temporary = path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+                temporary.replace(path)
+
+        if self.is_world_process_zero():
+            (Path(self.args.output_dir) / "training_diagnostics.jsonl").write_text("", encoding="utf-8")
+        write_status("started")
+        try:
+            output = super().train(*args, **kwargs)
+        except BaseException as exc:
+            write_status("failed", f"{type(exc).__name__}: {exc}")
+            raise
         if self.args.max_steps <= 0 and (
             self._observed_microbatch_count != len(self._expected_rank_microbatches)
         ):
+            write_status("failed", "Incomplete manifest consumption")
             raise RuntimeError(
                 f"Trainer consumed {self._observed_microbatch_count} microbatches, but the "
                 f"manifest defines {len(self._expected_rank_microbatches)} for this rank"
             )
+        write_status("limited" if self.args.max_steps > 0 else "completed")
         return output

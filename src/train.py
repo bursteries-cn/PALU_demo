@@ -1,4 +1,5 @@
 import os
+import json
 from collections.abc import MutableMapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -46,6 +47,10 @@ def main(cfg: DictConfig):
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "resolved_config.yaml").write_text(
             OmegaConf.to_yaml(cfg, resolve=True),
+            encoding="utf-8",
+        )
+        (output_dir / "resolved_config.json").write_text(
+            json.dumps(OmegaConf.to_container(cfg, resolve=True), ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
 

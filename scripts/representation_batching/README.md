@@ -174,3 +174,126 @@ If the 8B active model plus frozen reference does not fit under this ZeRO-3
 configuration, record the peak-memory failure and revise the resource setting.
 Do not silently switch one arm to LoRA, CPU offload, another optimizer, or a
 different effective batch.
+
+## 6. Unified results: one HTML entry point
+
+From the repository root, refresh the report after training or evaluation:
+
+```bash
+python3 scripts/representation_batching/summarize_results.py \
+  --config configs/analysis/representation_batching.json
+```
+
+Open `reports/representation_batching/index.html`. This static page contains the
+planned seed/arm coverage, a searchable run table, final TOFU metrics, batch
+similarity diagnostics, per-run training curves, within-protocol mean/sample
+standard deviation, and same-seed differences against `R/random`. Raw exports
+are `runs.csv`, `coverage.csv`, `aggregates.csv`, `paired_deltas.csv`, and
+`results.json`. Re-run the command to refresh; the page is not a live monitor.
+No GPU, model weights, W&B login, or web service is required for reporting.
+New runs can be read with the Python standard library. Legacy YAML-only runs
+need PyYAML in the reporting environment.
+
+To scan scattered training directories, repeat `--root` (these override roots in
+config). Source files are not moved or modified:
+
+```bash
+python3 scripts/representation_batching/summarize_results.py \
+  --config configs/analysis/representation_batching.json \
+  --root /absolute/server/experiment-A \
+  --root /absolute/server/experiment-B \
+  --out reports/representation_batching
+```
+
+Paths in the JSON config resolve relative to the config file; command-line
+paths resolve relative to the current directory. For evaluation results stored
+elsewhere, add explicit associations to `evaluations` in the config:
+
+```json
+"evaluations": [
+  {
+    "run_dir": "/absolute/path/to/run",
+    "summary": "/absolute/path/to/separate/eval/TOFU_SUMMARY.json"
+  }
+]
+```
+
+The default automatic evaluation location is `<run>/evals/TOFU_SUMMARY.json`.
+Multiple final summaries for one run are flagged as ambiguous; the report does
+not choose the largest metric or most recent file. It does not infer identity
+from timestamp/run-name similarity or mix intermediate checkpoint metrics into
+final-model comparisons.
+
+For future completed runs, put evaluation outputs there directly:
+
+```bash
+python3 scripts/representation_batching/evaluate_run.py \
+  --run /absolute/path/to/run \
+  --retain-logs /absolute/path/to/matched/retain95/TOFU_EVAL.json \
+  --gpu 0
+```
+
+This launches the existing single-GPU TOFU evaluator with the run's model type,
+Forget/Holdout splits, and a saved final model. It recomputes metrics
+(`overwrite=true`) so cached evaluations from other settings cannot be silently
+relabelled. `--dry-run` prints the command without loading the model. The current
+helper uses the repository's default TOFU evaluation configuration; custom
+prompts, offline evaluation datasets, or other metric overrides require calling
+`src/eval.py` directly with those overrides and `paths.output_dir=<run>/evals`.
+The supplied Retain logs must use the same model/split/evaluation protocol.
+
+### Read the report in this order
+
+1. **Coverage/status:** `limited` is a max-steps run, excluded from final
+   comparisons. `incomplete_or_unknown` means there is insufficient completion
+   evidence, not proof that a process is currently running or failed.
+2. **Audit:** planned and observed microbatches must agree on every rank, and
+   archived plans must reproduce the actual batch manifest. An exhausted log
+   alone is not proof the last optimizer update finished.
+3. **Grouping and order:** inspect within-batch cosine for grouping experiments;
+   newly generated manifests additionally store `previous_batch_cosine` for
+   adjacent-batch order. This uses true representations and excludes the first
+   batch of each epoch. Older manifests show this field as missing. Compare
+   question/answer lengths and initial sequence NLL as potential covariates.
+4. **Trajectories:** inspect forget/retain losses and NPO weight/near-zero
+   fraction. These are training diagnostics, not deletion scores. Diagnostics
+   are measured before the incoming optimizer update, including the last point.
+5. **Final outcomes:** compare matching protocols and paired seeds, considering
+   Forget quality, utility, fluency, and matched Retain exact memorization
+   together. FQ is a KS p-value, not a forgetting percentage; its difference is
+   not a calibrated effect size. No composite ranking is generated.
+
+For a batch-order comparison, set `expected_arms` to e.g.
+`["S/random", "S/similar", "S/diverse"]` and `reference_arm` to `"S/random"`.
+Keep `expected_seeds` consistent with the actual experiment plan. Coverage is a
+coarse inventory across all scanned settings, while statistics are separated by
+training and evaluation protocol fingerprints. Duplicate seed/arm runs within a
+protocol are displayed but excluded from aggregation and paired differences
+until you explicitly select the intended run directories.
+
+### New output files and legacy compatibility
+
+New training runs persist `resolved_config.json`, `training_diagnostics.jsonl`,
+and `training_status.json` independently of model saving, including `--no-save`.
+A `completed` training marker means the trainer returned after full schedule
+consumption, not that model saving or final evaluation succeeded. Process kills
+may leave `started`; the report treats that as unknown rather than live status.
+A positive `max_steps` is conservatively always classified as `limited`.
+
+Standalone evaluation now writes `evaluation_provenance.json` with resolved
+settings, evaluator/data/model source hashes, Retain log hash, and completion
+state. Only a completed evaluation attached to the run's final model with all
+configured metrics present can enter formal aggregation. Reusing old cached
+metrics without matching provenance leaves it unverified. Old summary JSONs
+still appear in the ledger but do not automatically enter paired comparisons.
+Full/Retain baseline files in the config are shown as references only; protocol
+compatibility is not assumed. Missing metrics are never replaced with zero.
+
+To inspect server results on a laptop, either copy the generated report folder
+(HTML/CSV/JSON work offline), or copy each run's small config/status/diagnostic
+files, `batch_audit`, `trainer_state.json` if available, and `evals` for rebuilding
+locally. Weights are unnecessary. Archived original output paths allow final
+model provenance to survive a move; links to uncopied source files naturally
+remain unavailable. Different absolute dataset/model paths conservatively form
+separate training cohorts. No remote connection or sync is performed by the
+reporting script.

@@ -1,5 +1,8 @@
 import hydra
-from omegaconf import DictConfig
+import hashlib
+import json
+from pathlib import Path
+from omegaconf import DictConfig, OmegaConf
 
 from evals import get_evaluators
 from model import get_model
@@ -21,12 +24,44 @@ def main(cfg: DictConfig):
     eval_cfgs = cfg.eval
     evaluators = get_evaluators(eval_cfgs)
     for evaluator_name, evaluator in evaluators.items():
+        output_dir = Path(str(eval_cfgs[evaluator_name].output_dir))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        source_root = Path(__file__).resolve().parent
+        sources = sorted((source_root / "evals").rglob("*.py"))
+        sources += sorted((source_root / "data").rglob("*.py"))
+        sources += sorted((source_root / "model").rglob("*.py"))
+        provenance = {
+            "config": OmegaConf.to_container(cfg, resolve=True),
+            "code_sha256": {
+                str(path.relative_to(source_root)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in sources
+            },
+            "status": "started",
+        }
+        reference = eval_cfgs[evaluator_name].get("retain_logs_path")
+        if reference and Path(str(reference)).is_file():
+            provenance["reference_sha256"] = hashlib.sha256(Path(str(reference)).read_bytes()).hexdigest()
+        provenance_path = output_dir / "evaluation_provenance.json"
+        try:
+            previous = json.loads(provenance_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        cached = any(output_dir.glob("*_EVAL.json")) and not eval_cfgs[evaluator_name].overwrite
+        verified_cache = (
+            previous.get("status") == "completed"
+            and previous.get("config") == provenance["config"]
+            and previous.get("code_sha256") == provenance["code_sha256"]
+            and previous.get("reference_sha256") == provenance.get("reference_sha256")
+        )
+        provenance_path.write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
         eval_args = {
             "template_args": template_args,
             "model": model,
             "tokenizer": tokenizer,
         }
         _ = evaluator.evaluate(**eval_args)
+        provenance["status"] = "completed_unverified_cache" if cached and not verified_cache else "completed"
+        provenance_path.write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

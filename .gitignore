@@ -182,3 +182,4 @@ cython_debug/
 /saves/unlearn/
 /artifacts/representation_batching/
 /reports/hparam_analysis/
+/reports/representation_batching/

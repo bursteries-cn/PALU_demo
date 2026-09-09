@@ -1,0 +1,11 @@
+{
+  "roots": ["../../saves/unlearn"],
+  "expected_arms": ["R/random", "S/random", "D/random", "P/random"],
+  "expected_seeds": [0, 1, 2],
+  "reference_arm": "R/random",
+  "evaluations": [],
+  "baselines": [
+    {"label": "Full (local reference)", "summary": "../../saves/eval/tofu_Llama-3.1-8B-Instruct_full/evals_forget05/TOFU_SUMMARY.json"},
+    {"label": "Retain95 (local reference)", "summary": "../../saves/eval/tofu_Llama-3.1-8B-Instruct_retain95/TOFU_SUMMARY.json"}
+  ]
+}

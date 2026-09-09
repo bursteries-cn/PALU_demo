@@ -262,6 +262,10 @@ def build_arm_steps(
                     "within_batch_cosine": mean_pairwise_cosine(
                         forget_ids, true_similarity, row
                     ),
+                    "previous_batch_cosine": (
+                        _cross_batch_cosine(batches[optimizer_step - 1], forget_ids, true_similarity, row)
+                        if optimizer_step > 0 else None
+                    ),
                 }
             )
     return steps
@@ -323,6 +327,7 @@ def write_batch_stats(path: str | Path, manifests: Mapping[str, Sequence[Mapping
                 "optimizer_step",
                 "batch_size",
                 "within_batch_cosine",
+                "previous_batch_cosine",
                 "question_tokens_mean",
                 "answer_tokens_mean",
                 "initial_answer_nll_mean",
@@ -341,6 +346,7 @@ def write_batch_stats(path: str | Path, manifests: Mapping[str, Sequence[Mapping
                         "optimizer_step": step["optimizer_step"],
                         "batch_size": len(step["forget_indices"]),
                         "within_batch_cosine": step["within_batch_cosine"],
+                        "previous_batch_cosine": step.get("previous_batch_cosine"),
                         "question_tokens_mean": step.get("question_tokens_mean"),
                         "answer_tokens_mean": step.get("answer_tokens_mean"),
                         "initial_answer_nll_mean": step.get(
