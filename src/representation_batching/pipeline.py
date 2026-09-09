@@ -13,12 +13,19 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-from representation_batching.report import build_report, collect_run, read_json
+from representation_batching.report import METRICS, build_report, collect_run, read_json, write_csv
 from representation_batching.seed_comparison import export_comparison
 from representation_batching.local_dataset import resolve_local_dataset_config
 
 ROOT=Path(__file__).resolve().parents[2]
 ARMS=("R","S","D","P")
+# The first released pipeline included reporting/orchestration code in its hash.
+# These files do not change the training/evaluation numerical protocol.
+CONTROL_FILES={"src/representation_batching/pipeline.py",
+               "src/representation_batching/report.py",
+               "src/representation_batching/seed_comparison.py"}
+LEGACY_PIPELINE_COMMITS=("a5d9198698d99f1ec0699e99bb3e17b0cb039dcf",
+                         "b1d2b1ebdb712ebc25b794091e9f726a75a54985")
 
 
 def hash_file(path):
@@ -101,19 +108,49 @@ def load_settings(config_path,root=ROOT):
     return settings
 
 
-def fingerprint(settings,root=ROOT):
+def fingerprint_payload(settings,root=ROOT,revision=None):
     # Path/config changes cannot silently resume into a different experiment.
     effective={k:v for k,v in settings.items() if k not in ("scan_roots","report_dir","expected_seeds","training_gpus","evaluation_gpu")}
-    sources=[]
-    for directory in ("src/trainer","src/data","src/model","src/evals","src/representation_batching","configs/model","configs/trainer","configs/accelerate","configs/data","configs/eval","configs/collator"):
-        sources.extend(p for p in (root/directory).rglob("*") if p.is_file() and p.suffix in (".py",".yaml",".json"))
-    for name in ("src/train.py","src/eval.py","configs/unlearn.yaml","configs/eval.yaml",
+    directories=("src/trainer","src/data","src/model","src/evals","src/representation_batching","configs/model","configs/trainer","configs/accelerate","configs/data","configs/eval","configs/collator")
+    files=("src/train.py","src/eval.py","configs/unlearn.yaml","configs/eval.yaml",
                  "configs/experiment/unlearn/tofu/representation_npo.yaml","configs/experiment/eval/tofu/default.yaml",
                  "scripts/representation_batching/build_batch_manifests.py",
-                 "scripts/representation_batching/run_npo_representation.sh","scripts/representation_batching/evaluate_run.py"):
-        if (root/name).exists(): sources.append(root/name)
-    effective["code"]={str(p.relative_to(root)):hash_file(p) for p in sorted(sources)}
-    return hashlib.sha256(json.dumps(effective,sort_keys=True).encode()).hexdigest()
+                 "scripts/representation_batching/run_npo_representation.sh","scripts/representation_batching/evaluate_run.py")
+    if revision:
+        names=subprocess.check_output(["git","ls-tree","-r","--name-only",revision],cwd=root,text=True).splitlines()
+        names=[name for name in names if name in files or (Path(name).suffix in (".py",".yaml",".json") and any(name.startswith(d+"/") for d in directories))]
+        effective["code"]={name:hashlib.sha256(subprocess.check_output(["git","show",f"{revision}:{name}"],cwd=root)).hexdigest() for name in names}
+    else:
+        sources=set()
+        for directory in directories:
+            sources.update(p for p in (root/directory).rglob("*") if p.is_file() and p.suffix in (".py",".yaml",".json"))
+        sources.update(root/name for name in files if (root/name).exists())
+        effective["code"]={str(p.relative_to(root)):hash_file(p) for p in sorted(sources)}
+    return effective
+
+
+def payload_digest(payload,exclude_controls=True):
+    payload=dict(payload)
+    if exclude_controls:
+        payload["code"]={k:v for k,v in payload["code"].items() if k not in CONTROL_FILES}
+    return hashlib.sha256(json.dumps(payload,sort_keys=True).encode()).hexdigest()
+
+
+def fingerprint(settings,root=ROOT):
+    return payload_digest(fingerprint_payload(settings,root))
+
+
+def compatible_legacy_signature(signature,settings,root=ROOT):
+    """Accept only a reproducible legacy hash with unchanged numerical sources."""
+    current=fingerprint(settings,root)
+    for revision in LEGACY_PIPELINE_COMMITS:
+        try:
+            legacy=fingerprint_payload(settings,root,revision)
+            if payload_digest(legacy,False)==signature and payload_digest(legacy)==current:
+                return True
+        except (OSError,subprocess.CalledProcessError):
+            continue
+    return False
 
 
 def commands(settings,seed,arm,run,root=ROOT):
@@ -158,13 +195,19 @@ def saved_model(run):
 
 def inspect_run(run):
     try:
-        row,_,_=collect_run(run,[],[])
+        row,_,_=collect_run(run,[],[],include_evaluation=False)
         marker=run/"model_save_complete.json"
         trained=(row["training_status"]=="completed" and saved_model(run)
                  and marker.is_file() and read_json(marker).get("status")=="completed")
-        return trained, trained and row["eligible"] and all(finite_metric(row.get(m)) for m in ("exact_memorization","forget_quality","forget_Q_A_gibberish","model_utility"))
     except (OSError,ValueError,KeyError,TypeError):
         return False,False
+    # A failed/partially written evaluation must never invalidate saved training.
+    try:
+        row,_,_=collect_run(run,[],[])
+        evaluated=row["eligible"] and all(finite_metric(row.get(m)) for m in METRICS)
+    except (OSError,ValueError,KeyError,TypeError):
+        evaluated=False
+    return trained, trained and evaluated
 
 
 def finite_metric(value):
@@ -204,6 +247,52 @@ def refresh(settings,seed):
     print(f"结果表 / 图：{out/'seed_comparison.html'}",flush=True)
 
 
+def save_seed_results(seed_root,state):
+    """Persist four rows, including pending/failed arms, without model copies."""
+    rows=[]
+    for arm in ARMS:
+        entry=state["arms"].get(arm,{})
+        run=Path(entry["run_dir"]) if entry.get("run_dir") else None
+        row={"seed":state["seed"],"arm":arm,"status":entry.get("status","pending"),
+             **{metric:None for metric in METRICS},"run_dir":str(run) if run else "",
+             "summary_path":"","evaluation_path":"","evaluation_status":"missing",
+             "error":entry.get("error","")}
+        if run:
+            summary=run/"evals/TOFU_SUMMARY.json"
+            details=run/"evals/TOFU_EVAL.json"
+            row["summary_path"]=str(summary) if summary.exists() else ""
+            row["evaluation_path"]=str(details) if details.exists() else ""
+            try:
+                collected,_,_=collect_run(run,[],[])
+                row["evaluation_status"]=collected["evaluation_status"]
+                # Failed attempts may contain stale/partial metrics. Only publish
+                # metrics from an arm that passed the pipeline's full validation.
+                if row["status"]=="completed" and collected["eligible"]:
+                    row.update({m:collected.get(m) for m in METRICS})
+            except (OSError,ValueError,KeyError,TypeError) as exc:
+                row["evaluation_status"]="unreadable_or_incomplete"
+                if not row["error"]: row["error"]=str(exc)
+        rows.append(row)
+    write_state(seed_root/"seed_results.json",{"seed":state["seed"],"status":state.get("status","running"),"runs":rows})
+    temp=seed_root/"seed_results.csv.tmp"
+    write_csv(temp,rows)
+    temp.replace(seed_root/"seed_results.csv")
+
+
+def describe_incomplete(run,stage):
+    try:
+        row,_,_=collect_run(run,[],[],include_evaluation=stage=="evaluation")
+        details=f"training={row['training_status']}, audit={row['audit']}"
+        if stage=="training":
+            details+=f", model_files={saved_model(run)}, save_marker={(run/'model_save_complete.json').exists()}"
+        else:
+            missing=[m for m in METRICS if not finite_metric(row.get(m))]
+            details+=f", evaluation={row['evaluation_status']}, missing_metrics={missing}"
+        return details
+    except (OSError,ValueError,KeyError,TypeError) as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
 def run_seed(settings,seed,signature,root=ROOT,runner=None,inspector=None,refresher=None):
     runner=runner or (lambda command,log:run_command(command,log,root))
     inspector=inspector or inspect_run
@@ -215,51 +304,91 @@ def run_seed(settings,seed,signature,root=ROOT,runner=None,inspector=None,refres
         except BlockingIOError as exc: raise ValueError(f"seed {seed} 正在运行，请勿重复启动") from exc
         state_path=seed_root/"pipeline_state.json"
         state=read_json(state_path) if state_path.exists() else {"seed":seed,"signature":signature,"settings":settings,"arms":{}}
+        previous_signature=state["signature"]
         if state["signature"]!=signature:
-            raise ValueError("本 seed 的配置/特征/代码与上次不同，已停止自动续跑。请恢复原设置，或在配置中选择新的 output_root 和 manifest_root。")
+            if signature==fingerprint(settings,root) and compatible_legacy_signature(previous_signature,settings,root):
+                state["signature"]=signature
+                print("旧版进度已兼容：训练/评估设置与计算代码未改变，保留现有模型与结果。",flush=True)
+            else:
+                raise ValueError("本 seed 的配置/特征/计算代码与上次不同，已停止自动续跑。请恢复原设置，或在配置中选择新的 output_root 和 manifest_root。")
         manifest_root=Path(settings["manifest_root"])/f"seed-{seed}"
         owner_path=manifest_root/"pipeline_owner.json"
         manifest_files=[manifest_root/f"{arm}.jsonl" for arm in ARMS]
         if any(path.exists() for path in manifest_files):
-            if not owner_path.exists() or read_json(owner_path).get("signature")!=signature:
+            if not owner_path.exists() or read_json(owner_path).get("signature") not in (previous_signature,signature):
                 raise ValueError(f"清单目录已有其他来源的文件：{manifest_root}；请选择新的 manifest_root，避免覆盖")
         manifest_root.mkdir(parents=True,exist_ok=True)
         write_state(owner_path,{"signature":signature})
+        state["status"]="running"
+        state.pop("error",None)
+        for arm in ARMS:
+            state["arms"].setdefault(arm,{"attempts":[],"status":"pending"})
+        write_state(state_path,state)
+        save_seed_results(seed_root,state)
         try:
             if not all(path.exists() for path in manifest_files):
                 runner(commands(settings,seed,"R",seed_root/"R/attempt-0001",root)[0],seed_root/"logs/manifests.log")
-            for arm in ARMS:
-                entry=state["arms"].setdefault(arm,{"attempts":[]})
-                current=Path(entry["run_dir"]) if entry.get("run_dir") else None
-                trained,evaluated=inspector(current) if current else (False,False)
-                if not trained:
-                    attempt=len(entry["attempts"])+1
-                    current=seed_root/arm/f"attempt-{attempt:04d}"
-                    while current.exists():
-                        attempt+=1; current=seed_root/arm/f"attempt-{attempt:04d}"
-                    entry["run_dir"]=str(current); entry["attempts"].append(str(current)); entry["status"]="training"
+            failures=[]
+            for index,arm in enumerate(ARMS,1):
+                entry=state["arms"][arm]
+                entry.pop("error",None)
+                stage="training"
+                try:
+                    current=Path(entry["run_dir"]) if entry.get("run_dir") else None
+                    trained,evaluated=inspector(current) if current else (False,False)
+                    if not trained:
+                        attempt=len(entry["attempts"])+1
+                        current=seed_root/arm/f"attempt-{attempt:04d}"
+                        while current.exists():
+                            attempt+=1; current=seed_root/arm/f"attempt-{attempt:04d}"
+                        entry["run_dir"]=str(current); entry["attempts"].append(str(current)); entry["status"]="training"
+                        write_state(state_path,state)
+                        save_seed_results(seed_root,state)
+                        print(f"[seed {seed}] [{index}/4] {arm}: 开始训练 → {current}",flush=True)
+                        runner(commands(settings,seed,arm,current,root)[1],seed_root/f"logs/{arm}-attempt-{attempt:04d}-train.log")
+                        trained,evaluated=inspector(current)
+                        if not trained:
+                            raise ValueError(f"训练命令返回但完成检查未通过：{describe_incomplete(current,'training')}；目录：{current}")
+                    else:
+                        print(f"[seed {seed}] [{index}/4] {arm}: 跳过已完成训练",flush=True)
+                    stage="evaluation"
+                    if not evaluated:
+                        entry["status"]="evaluating"; write_state(state_path,state)
+                        save_seed_results(seed_root,state)
+                        print(f"[seed {seed}] [{index}/4] {arm}: 开始评估 → {current/'evals'}",flush=True)
+                        runner(commands(settings,seed,arm,current,root)[2],seed_root/f"logs/{arm}-eval.log")
+                        if not inspector(current)[1]:
+                            raise ValueError(f"评估命令返回但完成检查未通过：{describe_incomplete(current,'evaluation')}；目录：{current}")
+                    else:
+                        print(f"[seed {seed}] [{index}/4] {arm}: 跳过已完成评估",flush=True)
+                    entry["status"]="completed"
+                except (OSError,ValueError,KeyError,TypeError,subprocess.CalledProcessError) as exc:
+                    entry["status"]=stage+"_failed"
+                    entry["error"]=f"{type(exc).__name__}: {exc}"
+                    failures.append(f"{arm}: {entry['error']}")
+                    print(f"[seed {seed}] [{index}/4] {arm}: {stage} 失败；已记录，将继续其余组。\n{entry['error']}",file=sys.stderr,flush=True)
+                except (KeyboardInterrupt,SystemExit):
+                    entry["status"]="interrupted"
+                    entry["error"]=f"Interrupted during {stage}"
+                    raise
+                finally:
                     write_state(state_path,state)
-                    print(f"[seed {seed}] {arm}: 开始训练 → {current}",flush=True)
-                    runner(commands(settings,seed,arm,current,root)[1],seed_root/f"logs/{arm}-attempt-{attempt:04d}-train.log")
-                    trained,evaluated=inspector(current)
-                    if not trained: raise ValueError(f"{arm} 训练命令返回，但未找到完整训练/模型保存证据：{current}")
-                else:
-                    print(f"[seed {seed}] {arm}: 跳过已完成训练",flush=True)
-                if not evaluated:
-                    entry["status"]="evaluating"; write_state(state_path,state)
-                    runner(commands(settings,seed,arm,current,root)[2],seed_root/f"logs/{arm}-eval.log")
-                    if not inspector(current)[1]: raise ValueError(f"{arm} 评估返回，但四个完整指标/来源核验未通过：{current}")
-                else:
-                    print(f"[seed {seed}] {arm}: 跳过已完成评估",flush=True)
-                entry["status"]="completed"; write_state(state_path,state)
-            state["status"]="completed"; state.pop("error",None); write_state(state_path,state)
+                    save_seed_results(seed_root,state)
+            if failures:
+                state["status"]="partial_failed"
+                raise ValueError("四组已全部尝试，以下组未完成：\n"+"\n".join(failures)+f"\n修复原因后重跑同一 seed；进度与结果：{seed_root/'seed_results.csv'}")
+            state["status"]="completed"
         except BaseException as exc:
-            state["status"]="interrupted_or_failed"; state["error"]=f"{type(exc).__name__}: {exc}"
-            write_state(state_path,state)
+            if state["status"]!="partial_failed": state["status"]="interrupted_or_failed"
+            state["error"]=f"{type(exc).__name__}: {exc}"
             raise
         finally:
+            write_state(state_path,state)
+            save_seed_results(seed_root,state)
             try: refresher(settings,seed)
             except Exception as exc: print(f"WARNING: 汇总暂未生成：{exc}；可单独运行 compare_seeds.py。",file=sys.stderr)
+            print(f"seed {seed} 四组状态："+", ".join(f"{a}={state['arms'][a]['status']}" for a in ARMS),flush=True)
+            print(f"本 seed 结果：{seed_root/'seed_results.csv'}",flush=True)
     return state
 
 
@@ -283,7 +412,7 @@ def main():
                 for command in ([build] if index==0 else [])+[train,evaluate]: print(shlex.join(command))
             print("最后自动刷新 reports 中的总览、seed_comparison.csv 和 PNG/PDF/SVG。")
             return
-        missing=[name for name in ("numpy","torch","transformers","accelerate","hydra","matplotlib") if importlib.util.find_spec(name) is None]
+        missing=[name for name in ("numpy","torch","transformers","accelerate","hydra") if importlib.util.find_spec(name) is None]
         if missing: raise ValueError("当前 Python 环境缺少："+", ".join(missing)+"；请先激活项目训练环境")
         run_seed(settings,args.seed,fingerprint(settings))
     except (OSError,ValueError,KeyError,subprocess.CalledProcessError) as exc:

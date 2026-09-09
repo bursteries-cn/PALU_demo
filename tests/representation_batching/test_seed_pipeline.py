@@ -6,12 +6,16 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/"src"))
-from representation_batching.pipeline import run_seed, commands, hash_file, load_settings, saved_model, run_command
+from representation_batching.pipeline import (run_seed, commands, hash_file, load_settings,
+    saved_model, run_command, inspect_run, save_seed_results, fingerprint,
+    fingerprint_payload, payload_digest, compatible_legacy_signature)
 from representation_batching.seed_comparison import select_cells, export_comparison, manual_rows
 from representation_batching.evaluation_config import set_tofu_dataset_paths, validate_local_tofu_files
+from test_report import fixture
 
 
 def write(path,value):
@@ -112,6 +116,11 @@ class PipelineTests(unittest.TestCase):
             cfg=settings(Path(temp)); calls,runner,inspector=self.fake_executor(cfg,1,True)
             with self.assertRaisesRegex(ValueError,'simulated'):
                 run_seed(cfg,1,'sig',runner=runner,inspector=inspector,refresher=lambda *_:None)
+            self.assertEqual(sum(c[0]=='bash' for c in calls),4)
+            state=json.loads((Path(cfg['output_root'])/'seed-1/pipeline_state.json').read_text())
+            self.assertEqual(state['status'],'partial_failed')
+            self.assertEqual(state['arms']['R']['status'],'evaluation_failed')
+            self.assertTrue(all(state['arms'][a]['status']=='completed' for a in ('S','D','P')))
             run_seed(cfg,1,'sig',runner=runner,inspector=inspector,refresher=lambda *_:None)
             self.assertEqual(sum(c[0]=='bash' for c in calls),4)
             self.assertEqual(sum('--run' in c for c in calls),5)
@@ -120,7 +129,7 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             cfg=settings(Path(temp)); calls,runner,inspector=self.fake_executor(cfg,1)
             run_seed(cfg,1,'sig',runner=runner,inspector=inspector,refresher=lambda *_:None)
-            with self.assertRaisesRegex(ValueError,'配置/特征/代码'):
+            with self.assertRaisesRegex(ValueError,'配置/特征/计算代码'):
                 run_seed(cfg,1,'different',runner=runner,inspector=inspector,refresher=lambda *_:None)
             folder=Path(cfg['manifest_root'])/'seed-2'; folder.mkdir()
             (folder/'R.jsonl').write_text('foreign')
@@ -136,6 +145,130 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'training failed'):
                 run_seed(cfg,3,'sig',runner=runner,inspector=lambda _: (False,False),refresher=lambda *_:None)
             self.assertFalse(any('--run' in c for c in calls))
+            self.assertEqual(sum(c[0]=='bash' for c in calls),4)
+
+    def test_corrupt_evaluation_does_not_repeat_successful_training(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run=fixture(Path(temp))
+            write(run/'config.json',{})
+            write(run/'model_save_complete.json',{'status':'completed'})
+            (run/'model.safetensors').write_bytes(b'weights')
+            (run/'evals/TOFU_SUMMARY.json').write_text('{')
+            self.assertEqual(inspect_run(run),(True,False))
+            (run/'evals/TOFU_SUMMARY.json').unlink()
+            self.assertEqual(inspect_run(run),(True,False))
+
+    def test_seed_results_include_four_arms_metrics_paths_and_failures(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); run=fixture(root)
+            write(run/'evals/TOFU_SUMMARY.json',dict.fromkeys(
+                ('forget_quality','model_utility','exact_memorization','forget_Q_A_gibberish'),0))
+            write(run/'evals/TOFU_EVAL.json',{'examples':[]})
+            state={'seed':0,'status':'partial_failed','arms':{
+                'R':{'status':'completed','run_dir':str(run)},
+                'S':{'status':'evaluation_failed','run_dir':str(run),'error':'failed eval'}}}
+            save_seed_results(root,state)
+            rows=json.loads((root/'seed_results.json').read_text())['runs']
+            self.assertEqual([r['arm'] for r in rows],['R','S','D','P'])
+            self.assertEqual(rows[0]['model_utility'],0)
+            self.assertEqual(rows[0]['evaluation_path'],str(run/'evals/TOFU_EVAL.json'))
+            self.assertIsNone(rows[1]['model_utility'])
+            self.assertEqual(rows[1]['error'],'failed eval')
+            self.assertEqual(rows[2]['status'],'pending')
+            self.assertTrue((root/'seed_results.csv').exists())
+
+    def test_real_inspection_continues_after_r_failure_and_resumes_only_r(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); cfg=settings(root); calls=[]; fail=[True]
+            def runner(command,log):
+                calls.append(command)
+                if 'build_batch_manifests.py' in command[1]:
+                    path=Path(command[command.index('--output-dir')+1]); path.mkdir(exist_ok=True)
+                    for arm in ('R','S','D','P'): (path/f'{arm}.jsonl').write_text('manifest')
+                elif command[0]=='bash':
+                    path=Path(command[command.index('--output-dir')+1])
+                    fixture(path.parent,arm=path.parent.name,seed=1,name=path.name)
+                    write(path/'config.json',{})
+                    write(path/'model_save_complete.json',{'status':'completed'})
+                    (path/'model.safetensors').write_bytes(b'weights')
+                    (path/'evals/TOFU_SUMMARY.json').unlink()
+                else:
+                    path=Path(command[command.index('--run')+1])
+                    if path.parent.name=='R' and fail[0]:
+                        fail[0]=False
+                        (path/'evals/TOFU_SUMMARY.json').write_text('{')
+                        raise subprocess.CalledProcessError(9,command)
+                    write(path/'evals/TOFU_SUMMARY.json',dict.fromkeys(
+                        ('forget_quality','model_utility','exact_memorization','forget_Q_A_gibberish'),.5))
+            with self.assertRaisesRegex(ValueError,'四组已全部尝试'):
+                run_seed(cfg,1,'sig',runner=runner,refresher=lambda *_:None)
+            self.assertEqual(sum(c[0]=='bash' for c in calls),4)
+            rows=json.loads((root/'runs/seed-1/seed_results.json').read_text())['runs']
+            self.assertIsNone(rows[0]['model_utility'])
+            self.assertTrue(all(r['model_utility']==.5 for r in rows[1:]))
+            state=run_seed(cfg,1,'sig',runner=runner,refresher=lambda *_:None)
+            self.assertEqual(state['status'],'completed')
+            self.assertEqual(sum(c[0]=='bash' for c in calls),4)
+            self.assertEqual(sum('--run' in c for c in calls),5)
+
+    def test_interrupt_does_not_launch_remaining_arms(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg=settings(Path(temp)); calls=[]
+            def runner(command,log):
+                calls.append(command)
+                if command[0]=='bash': raise KeyboardInterrupt()
+            with self.assertRaises(KeyboardInterrupt):
+                run_seed(cfg,0,'sig',runner=runner,refresher=lambda *_:None)
+            self.assertEqual(sum(c[0]=='bash' for c in calls),1)
+            state=json.loads((Path(cfg['output_root'])/'seed-0/pipeline_state.json').read_text())
+            self.assertEqual(state['arms']['R']['status'],'interrupted')
+            self.assertEqual(state['arms']['S']['status'],'pending')
+
+    def test_protocol_hash_ignores_reporting_but_detects_training_changes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); cfg=settings(root)
+            path=root/'src/representation_batching/pipeline.py'
+            path.parent.mkdir(parents=True); path.write_text('old controls')
+            trainer=root/'src/trainer/unlearn.py'
+            trainer.parent.mkdir(); trainer.write_text('training')
+            before=fingerprint(cfg,root)
+            path.write_text('new controls')
+            self.assertEqual(before,fingerprint(cfg,root))
+            trainer.write_text('different training')
+            self.assertNotEqual(before,fingerprint(cfg,root))
+
+    def test_legacy_signature_requires_matching_settings_and_numerical_code(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); cfg=settings(root)
+            legacy=fingerprint_payload(cfg,root)
+            legacy['code']['src/representation_batching/pipeline.py']='old hash'
+            old_signature=payload_digest(legacy,False)
+            original=fingerprint_payload
+            def payload(settings,root,revision=None):
+                return legacy if revision else original(settings,root)
+            with patch('representation_batching.pipeline.fingerprint_payload',side_effect=payload):
+                self.assertTrue(compatible_legacy_signature(old_signature,cfg,root))
+                changed={**cfg,'learning_rate':9e-5}
+                self.assertFalse(compatible_legacy_signature(old_signature,changed,root))
+
+    def test_legacy_state_migration_keeps_models_and_manifest_ownership(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); cfg=settings(root)
+            current_signature=fingerprint(cfg,root)
+            legacy=fingerprint_payload(cfg,root)
+            legacy['code']['src/representation_batching/pipeline.py']='old hash'
+            old_signature=payload_digest(legacy,False)
+            calls,runner,inspector=self.fake_executor(cfg,1)
+            run_seed(cfg,1,old_signature,root,runner,inspector,lambda *_:None)
+            original=fingerprint_payload
+            def payload(settings,root,revision=None):
+                return legacy if revision else original(settings,root)
+            with patch('representation_batching.pipeline.fingerprint_payload',side_effect=payload):
+                state=run_seed(cfg,1,current_signature,root,runner,inspector,lambda *_:None)
+            self.assertEqual(len(calls),9)
+            self.assertEqual(state['signature'],current_signature)
+            owner=json.loads((root/'manifests/seed-1/pipeline_owner.json').read_text())
+            self.assertEqual(owner['signature'],current_signature)
 
     def test_settings_infer_sources_and_reject_bad_feature_digest(self):
         with tempfile.TemporaryDirectory() as temp:

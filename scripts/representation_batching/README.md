@@ -310,6 +310,9 @@ bash scripts/representation_batching/run_seed.sh 1
 脚本依次完成：复用初始特征 → 生成 seed 1 的 R/S/D/P 清单 → R 训练与评估 →
 S 训练与评估 → D 训练与评估 → P 训练与评估 → 更新总览、跨 seed 表格和四指标图。
 每一组均从同一份初始 Full 模型开始。训练使用两张 GPU，评估使用单张 GPU。
+终端显示 `[1/4] R` 到 `[4/4] P`，以及当前是在训练还是评估。
+单组训练/保存检查/评估失败会记录原因并继续其余组；四组全部尝试后，若仍有失败，
+脚本返回非零退出码并列出失败项。清单生成失败或手动中断则立即停止。
 只想预览路径与命令时，在末尾加 `--dry-run`；它不会创建运行目录或启动模型。
 
 ### 首次运行的路径配置
@@ -339,8 +342,15 @@ random batch order；它是四种**分组方式**的配对 seed 实验。
 同一个 seed 中途失败后，重新运行原命令即可。已完成且保存模型的训练不会重复；
 脚本同时检查全部模型分片和命令成功后写出的 `model_save_complete.json`，避免跳过未写完的模型。
 已完成且来源与四项指标核验通过的评估也会跳过。评估失败会重做该组评估。
+评估 JSON 缺失或损坏不会把已完成训练误判为需要重训。
 未完成的训练从 Full 模型开始，在新的 `attempt-*` 目录中重跑，旧记录保留。
 **这里是阶段级继续，不是恢复中断训练的 optimizer 状态。**
+
+每个 seed 的入口是 **`seed_results.csv` / `seed_results.json`**：始终有 R/S/D/P 四行，
+包括四个指标、各组状态、错误原因、模型目录，以及原始 SUMMARY/EVAL 的路径。
+每个阶段切换和每组结束都会更新，即使 R 失败也会保留 S/D/P 的结果。
+失败、未完成的组不填写指标，不拿残留的部分评估冒充完整结果。
+原始评估继续保存在各组 `evals/` 下，模型不会为生成结果表而额外复制。
 
 默认目录：
 
@@ -348,8 +358,11 @@ random batch order；它是四种**分组方式**的配对 seed 实验。
 artifacts/representation_batching/seed_runs/seed-1/   # 四份清单
 saves/unlearn/tofu/forget05/Llama-3.1-8B-Instruct/representation_npo/seed_runs/seed-1/
   pipeline_state.json                              # 四组进度、设置与运行路径
+  seed_results.csv / seed_results.json              # 本 seed 四组结果与文件入口，实时更新
   logs/                                            # 每阶段终端日志
   R/attempt-0001/                                   # 模型、训练诊断、evals/
+    evals/TOFU_SUMMARY.json                         # EM / Fluency / FQ / MU 四项汇总
+    evals/TOFU_EVAL.json                            # 指标计算缓存与样本级评估记录
   S/attempt-0001/
   D/attempt-0001/
   P/attempt-0001/
@@ -361,8 +374,11 @@ reports/representation_batching/
   seed_comparison.png / .pdf / .svg
 ```
 
-同一 seed 有进程锁，避免重复启动。重跑期间若配置、特征、Retain 日志或相关代码改变，
+同一 seed 有进程锁，避免重复启动。重跑期间若配置、特征、Retain 日志或训练/评估计算代码改变，
 脚本会停止，而不会混接两个协议；要做新条件，请另设 `output_root` 和 `manifest_root`。
+仅流程控制或报告代码修复不再阻止续跑。旧版 `a5d9198` / `b1d2b1e` 的进度可自动兼容：
+脚本会用 Git 中该版本重建旧签名，并确认实验设置和计算代码没有改变，才保留原进度。
+如果服务器缺少这个提交的 Git 历史，先获取该分支完整历史；不要手动删除状态文件强行跳过检查。
 旧版时间戳目录仍会进入汇总，但不自动被接管或视为本脚本的完成阶段。
 要依次运行 seed 1、2：
 

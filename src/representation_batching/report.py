@@ -132,7 +132,7 @@ def evaluation_protocol(provenance, run, summary):
                    "code": provenance["code_sha256"], "references": provenance.get("reference_sha256")})
 
 
-def collect_run(run, links, warnings):
+def collect_run(run, links, warnings, include_evaluation=True):
     run = run.expanduser().resolve()
     candidates = []
     for path in sorted((run / "batch_audit").glob("*.jsonl")):
@@ -189,6 +189,9 @@ def collect_run(run, links, warnings):
     row["diagnostic_points"] = len(curves)
     for name in DIAGNOSTICS:
         row["last_" + name] = next((x[name] for x in reversed(curves) if finite(x.get(name))), None)
+    if not include_evaluation:
+        row["eligible"] = False
+        return row, curves, steps
     candidates = set()
     conventional = run / "evals/TOFU_SUMMARY.json"
     if conventional.exists():
