@@ -15,6 +15,7 @@ from representation_batching.pipeline import (run_seed, commands, hash_file, loa
     fingerprint_payload, payload_digest, compatible_legacy_signature)
 from representation_batching.seed_comparison import select_cells, export_comparison, manual_rows
 from representation_batching.evaluation_config import set_tofu_dataset_paths, validate_local_tofu_files
+from representation_batching.report import LEGACY_MODEL_LOADER_SHA256, METRICS
 from test_report import fixture
 
 
@@ -65,6 +66,48 @@ class ComparisonTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_existing_r_with_legacy_provenance_is_reused_before_s_d_p(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); cfg=settings(root); seed_root=root/'runs/seed-2'
+            run=fixture(seed_root/'R',arm='R',seed=2,name='attempt-0001')
+            write(run/'config.json',{})
+            write(run/'model_save_complete.json',{'status':'completed'})
+            (run/'model.safetensors').write_bytes(b'weights')
+            write(run/'evals/TOFU_SUMMARY.json',dict.fromkeys(METRICS,.5))
+            path=run/'evals/evaluation_provenance.json'
+            provenance=json.loads(path.read_text())
+            provenance['config']['model']['model_args']['torch_dtype']='bfloat16'
+            write(run/'evals/.hydra/config.yaml',provenance['config'])
+            provenance['code_sha256']['model/__init__.py']=LEGACY_MODEL_LOADER_SHA256
+            for key in ('pretrained_model_name_or_path','torch_dtype'):
+                provenance['config']['model']['model_args'].pop(key)
+            write(path,provenance)
+            write(seed_root/'pipeline_state.json',{'seed':2,'signature':'sig','settings':cfg,
+                'arms':{'R':{'run_dir':str(run),'attempts':[str(run)],'status':'evaluating'}}})
+            manifests=root/'manifests/seed-2'; manifests.mkdir(parents=True)
+            write(manifests/'pipeline_owner.json',{'signature':'sig'})
+            for arm in ('R','S','D','P'): (manifests/f'{arm}.jsonl').write_text('manifest')
+            calls=[]
+            def runner(command,log):
+                calls.append(command)
+                if command[0]=='bash':
+                    path=Path(command[command.index('--output-dir')+1])
+                    fixture(path.parent,arm=path.parent.name,seed=2,name=path.name)
+                    write(path/'config.json',{})
+                    write(path/'model_save_complete.json',{'status':'completed'})
+                    (path/'model.safetensors').write_bytes(b'weights')
+                else:
+                    path=Path(command[command.index('--run')+1])
+                    write(path/'evals/TOFU_SUMMARY.json',dict.fromkeys(METRICS,.5))
+            state=run_seed(cfg,2,'sig',runner=runner,refresher=lambda *_:None)
+            self.assertEqual(state['status'],'completed')
+            self.assertEqual(sum(c[0]=='bash' for c in calls),3)
+            self.assertEqual(sum('--run' in c for c in calls),3)
+            self.assertFalse(any(str(run) in c for c in calls))
+            rows=json.loads((seed_root/'seed_results.json').read_text())['runs']
+            self.assertTrue(all(r['model_utility']==.5 for r in rows))
+            self.assertIn('归档配置恢复',rows[0]['evaluation_note'])
+
     def test_child_exit_code_and_log_are_preserved(self):
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'stage.log'

@@ -1,12 +1,13 @@
 from __future__ import annotations
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from representation_batching.report import build_report, collect_run, summarize
+from representation_batching.report import build_report, collect_run, summarize, LEGACY_MODEL_LOADER_SHA256
 
 
 def write(path, data):
@@ -49,6 +50,63 @@ def fixture(root, arm="R", seed=0, max_steps=-1, name=None):
 
 
 class ReportTests(unittest.TestCase):
+    def legacy_provenance(self, run):
+        path=run/'evals/evaluation_provenance.json'
+        provenance=json.loads(path.read_text())
+        provenance['config']['model']['model_args']['torch_dtype']='bfloat16'
+        original=json.loads(json.dumps(provenance))
+        write(run/'evals/.hydra/config.yaml',provenance['config'])
+        provenance['code_sha256']['model/__init__.py']=LEGACY_MODEL_LOADER_SHA256
+        for key in ('pretrained_model_name_or_path','torch_dtype'):
+            provenance['config']['model']['model_args'].pop(key)
+        write(path,provenance)
+        return original,provenance
+
+    def test_known_loader_mutation_is_recovered_without_rewriting_provenance(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run=fixture(Path(temp))
+            original,legacy=self.legacy_provenance(run)
+            before=(run/'evals/evaluation_provenance.json').read_bytes()
+            row,_,_=collect_run(run,[],[])
+            self.assertTrue(row['eligible'])
+            self.assertIn('归档配置恢复',row['evaluation_note'])
+            self.assertEqual(before,(run/'evals/evaluation_provenance.json').read_bytes())
+            original['code_sha256']=legacy['code_sha256']
+            write(run/'evals/evaluation_provenance.json',original)
+            self.assertEqual(row['evaluation_protocol'],collect_run(run,[],[])[0]['evaluation_protocol'])
+
+    def test_legacy_recovery_rejects_missing_conflicting_and_newer_archives(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run=fixture(Path(temp)); self.legacy_provenance(run)
+            archive=run/'evals/.hydra/config.yaml'
+            provenance_path=run/'evals/evaluation_provenance.json'
+            original=archive.read_text()
+            archive.unlink()
+            self.assertFalse(collect_run(run,[],[])[0]['eligible'])
+            archive.write_text(original)
+            os.utime(archive,ns=(1,1))
+            changed=json.loads(original)
+            changed['model']['model_args']['pretrained_model_name_or_path']=str(run/'checkpoint-1')
+            write(archive,changed); os.utime(archive,ns=(1,1))
+            self.assertFalse(collect_run(run,[],[])[0]['eligible'])
+            archive.write_text(original)
+            later=provenance_path.stat().st_mtime_ns+1_000_000_000
+            os.utime(archive,ns=(later,later))
+            self.assertFalse(collect_run(run,[],[])[0]['eligible'])
+
+    def test_legacy_recovery_rejects_unknown_loader_and_changed_model_args(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run=fixture(Path(temp)); _,legacy=self.legacy_provenance(run)
+            legacy['code_sha256']['model/__init__.py']='unknown'
+            write(run/'evals/evaluation_provenance.json',legacy)
+            self.assertFalse(collect_run(run,[],[])[0]['eligible'])
+            self.legacy_provenance(fixture(Path(temp)))
+            archive=run/'evals/.hydra/config.yaml'
+            changed=json.loads(archive.read_text())
+            changed['model']['model_args']['attn_implementation']='different'
+            write(archive,changed); os.utime(archive,ns=(1,1))
+            self.assertFalse(collect_run(run,[],[])[0]['eligible'])
+
     def test_pairing_and_html_csv_exports(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

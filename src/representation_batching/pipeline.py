@@ -26,6 +26,10 @@ CONTROL_FILES={"src/representation_batching/pipeline.py",
                "src/representation_batching/seed_comparison.py"}
 LEGACY_PIPELINE_COMMITS=("a5d9198698d99f1ec0699e99bb3e17b0cb039dcf",
                          "b1d2b1ebdb712ebc25b794091e9f726a75a54985")
+# Exact, reviewed metadata-only eval.py change: snapshot the request before the
+# loader consumes its path/dtype. Do not exempt future evaluator code changes.
+EVAL_PROVENANCE_FIX_SHA256="9e8979afd97614f2cd86060f2b0c365c9ad2f0d2a3bb1a1d41751254536ec602"
+LEGACY_EVAL_SHA256="b23d348348ce9b1f2b34c441e8570f020873ad180972e1e059e119297d2438b2"
 
 
 def hash_file(path):
@@ -133,6 +137,8 @@ def payload_digest(payload,exclude_controls=True):
     payload=dict(payload)
     if exclude_controls:
         payload["code"]={k:v for k,v in payload["code"].items() if k not in CONTROL_FILES}
+        if payload["code"].get("src/eval.py")==EVAL_PROVENANCE_FIX_SHA256:
+            payload["code"]["src/eval.py"]=LEGACY_EVAL_SHA256
     return hashlib.sha256(json.dumps(payload,sort_keys=True).encode()).hexdigest()
 
 
@@ -255,7 +261,7 @@ def save_seed_results(seed_root,state):
         run=Path(entry["run_dir"]) if entry.get("run_dir") else None
         row={"seed":state["seed"],"arm":arm,"status":entry.get("status","pending"),
              **{metric:None for metric in METRICS},"run_dir":str(run) if run else "",
-             "summary_path":"","evaluation_path":"","evaluation_status":"missing",
+             "summary_path":"","evaluation_path":"","evaluation_status":"missing","evaluation_note":"",
              "error":entry.get("error","")}
         if run:
             summary=run/"evals/TOFU_SUMMARY.json"
@@ -265,6 +271,7 @@ def save_seed_results(seed_root,state):
             try:
                 collected,_,_=collect_run(run,[],[])
                 row["evaluation_status"]=collected["evaluation_status"]
+                row["evaluation_note"]=collected.get("evaluation_note") or ""
                 # Failed attempts may contain stale/partial metrics. Only publish
                 # metrics from an arm that passed the pipeline's full validation.
                 if row["status"]=="completed" and collected["eligible"]:
@@ -361,6 +368,11 @@ def run_seed(settings,seed,signature,root=ROOT,runner=None,inspector=None,refres
                             raise ValueError(f"评估命令返回但完成检查未通过：{describe_incomplete(current,'evaluation')}；目录：{current}")
                     else:
                         print(f"[seed {seed}] [{index}/4] {arm}: 跳过已完成评估",flush=True)
+                        try:
+                            note=collect_run(current,[],[])[0].get("evaluation_note")
+                            if note: print(f"[seed {seed}] {arm}: {note}",flush=True)
+                        except (OSError,ValueError,KeyError,TypeError):
+                            pass
                     entry["status"]="completed"
                 except (OSError,ValueError,KeyError,TypeError,subprocess.CalledProcessError) as exc:
                     entry["status"]=stage+"_failed"

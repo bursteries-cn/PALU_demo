@@ -13,6 +13,8 @@ from pathlib import Path
 
 METRICS = ("forget_quality", "model_utility", "forget_Q_A_gibberish", "exact_memorization")
 DIAGNOSTICS = ("forget_loss", "retain_loss", "npo_weight_mean", "npo_weight_near_zero_fraction")
+# This archived loader removes exactly path and dtype from the caller's config.
+LEGACY_MODEL_LOADER_SHA256 = "0752bcf4993e4b1ed24964034460a7ccf2f21122a7de0052c61f5fe8e18f839b"
 
 
 def read_json(path):
@@ -35,18 +37,22 @@ def load_lines(path):
     return rows
 
 
+def read_config(path):
+    try:
+        return read_json(path)
+    except ValueError:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise ValueError("旧版 YAML 配置需要 PyYAML；新运行会同时保存 JSON") from exc
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
 def config_for(run):
     for name in ("resolved_config.json", "resolved_config.yaml", ".hydra/config.yaml"):
         path = run / name
         if path.exists():
-            try:
-                return read_json(path)
-            except ValueError:
-                try:
-                    import yaml
-                except ImportError as exc:
-                    raise ValueError("旧版 YAML 配置需要 PyYAML；新运行会同时保存 JSON") from exc
-                return yaml.safe_load(path.read_text(encoding="utf-8"))
+            return read_config(path)
     raise ValueError("缺少 resolved_config.json/yaml")
 
 
@@ -105,6 +111,47 @@ def audit_schedule(run, meta, steps):
     # Logs alone do not prove the final optimizer step returned successfully.
     status = "complete" if observed_counts == expected_counts else "prefix"
     return status, min(observed_counts), max(expected_counts)
+
+
+def recover_legacy_provenance(provenance, summary):
+    """Recover only the known loader mutation using matching archived evidence.
+
+    Return a copy; never rewrite historical provenance or infer a model from the
+    directory name alone. Unknown loaders or conflicting configs stay unverified.
+    """
+    model = provenance.get("config", {}).get("model", {})
+    args = model.get("model_args", {})
+    if args.get("pretrained_model_name_or_path"):
+        return provenance, None
+    if (provenance.get("status") != "completed" or
+            provenance.get("code_sha256", {}).get("model/__init__.py") != LEGACY_MODEL_LOADER_SHA256):
+        return provenance, None
+    try:
+        archive_path = summary.parent / ".hydra/config.yaml"
+        provenance_path = summary.parent / "evaluation_provenance.json"
+        # A later failed invocation may have overwritten Hydra's config while
+        # leaving old results. Such an archive cannot recover the earlier run.
+        if archive_path.stat().st_mtime_ns > provenance_path.stat().st_mtime_ns:
+            return provenance, None
+        archived = read_config(archive_path)["model"]
+        archived_args = archived["model_args"]
+        target = archived_args["pretrained_model_name_or_path"]
+        if not target or "torch_dtype" not in archived_args:
+            return provenance, None
+        tokenizer_target = model.get("tokenizer_args", {}).get("pretrained_model_name_or_path")
+        if not tokenizer_target or Path(target).resolve() != Path(tokenizer_target).resolve():
+            return provenance, None
+        consumed = json.loads(json.dumps(archived))
+        for key in ("pretrained_model_name_or_path", "torch_dtype"):
+            consumed["model_args"].pop(key)
+        if consumed != model:
+            return provenance, None
+        recovered = json.loads(json.dumps(provenance))
+        recovered["config"]["model"] = archived
+        note = "模型路径与 dtype 从同次评估归档配置恢复；已核对 tokenizer 路径、其余模型设置及旧版加载器哈希"
+        return recovered, note
+    except (OSError, ValueError, KeyError, TypeError):
+        return provenance, None
 
 
 def evaluation_protocol(provenance, run, summary):
@@ -176,6 +223,7 @@ def collect_run(run, links, warnings, include_evaluation=True):
         "protocol": training_protocol(config, meta, run),
         "manifest": str(manifest_path), "evaluation_status": "missing",
         "summary_path": None, "evaluation_protocol": None,
+        "evaluation_note": None,
         "error": status.get("error"),
     }
     for name in ("within_batch_cosine", "previous_batch_cosine", "question_tokens_mean", "answer_tokens_mean", "initial_answer_nll_mean"):
@@ -209,6 +257,8 @@ def collect_run(run, links, warnings, include_evaluation=True):
         row.update({key: value for key, value in metrics.items() if finite(value) and key not in row})
         provenance_path = path.parent / "evaluation_provenance.json"
         provenance = read_json(provenance_path) if provenance_path.exists() else {}
+        provenance, recovery_note = recover_legacy_provenance(provenance, path)
+        row["evaluation_note"] = recovery_note
         protocol = evaluation_protocol(provenance, run, path)
         row["evaluation_protocol"] = protocol
         required = set(provenance.get("config", {}).get("eval", {}).get("tofu", {}).get("metrics", {}))

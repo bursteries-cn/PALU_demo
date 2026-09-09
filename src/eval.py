@@ -22,6 +22,9 @@ def main(cfg: DictConfig):
         set_tofu_dataset_paths(evaluation, dataset_override)
         validate_local_tofu_files(evaluation, dataset_override)
         cfg.eval = OmegaConf.create(evaluation)
+    # get_model consumes model_args.path/dtype in place. Snapshot the resolved
+    # request before loading, so provenance retains the actual model and precision.
+    requested_config = OmegaConf.to_container(cfg, resolve=True)
     seed_everything(cfg.seed)
     model_cfg = cfg.model
     template_args = model_cfg.template_args
@@ -38,7 +41,7 @@ def main(cfg: DictConfig):
         sources += sorted((source_root / "data").rglob("*.py"))
         sources += sorted((source_root / "model").rglob("*.py"))
         provenance = {
-            "config": OmegaConf.to_container(cfg, resolve=True),
+            "config": requested_config,
             "code_sha256": {
                 str(path.relative_to(source_root)): hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in sources
