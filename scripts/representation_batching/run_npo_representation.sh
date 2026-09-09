@@ -8,6 +8,7 @@ MODEL_REVISION=""
 DATASET_PATH="locuslab/TOFU"
 DATASET_REVISION=""
 OUTPUT_ROOT="./saves/unlearn/tofu/forget05/Llama-3.1-8B-Instruct/representation_npo"
+EXACT_OUTPUT_DIR=""
 LEARNING_RATE="2e-5"
 SEED="0"
 MAX_STEPS="-1"
@@ -27,6 +28,7 @@ Options:
   --dataset PATH_OR_ID  TOFU dataset path or Hub id.
   --dataset-revision REV Optional immutable dataset revision.
   --output-root PATH    Parent output directory.
+  --output-dir PATH     Exact NEW run directory (used by run_seed.sh).
   --lr VALUE            Learning rate (default: 2e-5).
   --seed INT            Training seed; should match the manifest seed.
   --max-steps INT       Stop after this many optimizer steps; use 2 for smoke.
@@ -43,6 +45,7 @@ while [[ $# -gt 0 ]]; do
         --dataset) DATASET_PATH="$2"; shift 2 ;;
         --dataset-revision) DATASET_REVISION="$2"; shift 2 ;;
         --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
+        --output-dir) EXACT_OUTPUT_DIR="$2"; shift 2 ;;
         --lr) LEARNING_RATE="$2"; shift 2 ;;
         --seed) SEED="$2"; shift 2 ;;
         --max-steps) MAX_STEPS="$2"; shift 2 ;;
@@ -67,6 +70,13 @@ ARM_NAME=$(basename "${MANIFEST_PATH}" .jsonl)
 RUN_STAMP=$(date "+%Y%m%d-%H%M%S")
 TASK_NAME="representation_npo_${ARM_NAME}_seed${SEED}_${RUN_STAMP}"
 OUTPUT_DIR="${OUTPUT_ROOT}/${TASK_NAME}"
+if [[ -n "${EXACT_OUTPUT_DIR}" ]]; then
+    if [[ -e "${EXACT_OUTPUT_DIR}" ]]; then
+        echo "--output-dir must be new; refusing to overwrite ${EXACT_OUTPUT_DIR}" >&2
+        exit 2
+    fi
+    OUTPUT_DIR="${EXACT_OUTPUT_DIR}"
+fi
 
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 export WANDB_PROJECT="${WANDB_PROJECT:-npo-representation-batching}"
@@ -105,3 +115,7 @@ if [[ -n "${DATASET_REVISION}" ]]; then
 fi
 
 "${COMMAND[@]}"
+if [[ "${DO_SAVE}" == "true" ]]; then
+    # Written only after both distributed training and final model saving return.
+    printf '%s\n' '{"status":"completed"}' > "${OUTPUT_DIR}/model_save_complete.json"
+fi

@@ -237,8 +237,9 @@ This launches the existing single-GPU TOFU evaluator with the run's model type,
 Forget/Holdout splits, and a saved final model. It recomputes metrics
 (`overwrite=true`) so cached evaluations from other settings cannot be silently
 relabelled. `--dry-run` prints the command without loading the model. The current
-helper uses the repository's default TOFU evaluation configuration; custom
-prompts, offline evaluation datasets, or other metric overrides require calling
+helper uses the repository's default TOFU evaluation configuration. It accepts
+`--dataset`, `--classifier-model`, and `--batch-size` for local evaluation paths
+and batch size. Custom prompts or other metric overrides require calling
 `src/eval.py` directly with those overrides and `paths.output_dir=<run>/evals`.
 The supplied Retain logs must use the same model/split/evaluation protocol.
 
@@ -297,3 +298,97 @@ model provenance to survive a move; links to uncopied source files naturally
 remain unavailable. Different absolute dataset/model paths conservatively form
 separate training cohorts. No remote connection or sync is performed by the
 reporting script.
+
+## 7. 输入一个 seed，自动训练、评估、画图
+
+在项目训练环境中，从仓库根目录运行：
+
+```bash
+bash scripts/representation_batching/run_seed.sh 1
+```
+
+脚本依次完成：复用初始特征 → 生成 seed 1 的 R/S/D/P 清单 → R 训练与评估 →
+S 训练与评估 → D 训练与评估 → P 训练与评估 → 更新总览、跨 seed 表格和四指标图。
+每一组均从同一份初始 Full 模型开始。训练使用两张 GPU，评估使用单张 GPU。
+只想预览路径与命令时，在末尾加 `--dry-run`；它不会创建运行目录或启动模型。
+
+### 首次运行的路径配置
+
+集中配置文件是 `configs/analysis/representation_pipeline.json`。
+**这个文件里的相对路径统一相对于仓库根目录**，与上节报告配置的路径规则不同。
+通常只需要首次确认路径，后续只输入 seed：
+
+- `features: null`：先查默认 `artifacts/representation_batching/features-forget05/features.npz`，
+  找不到则在 artifacts 中找唯一一份特征文件。多个候选时请填写原文件路径。
+- `model: null` / `dataset: null`：沿用特征文件旁 `feature_manifest.json` 记录的模型和数据来源。
+  本地路径必须存在；搬过目录时，在这里填写新路径。不会自动切换模型或重新提取特征。
+- `retain_logs`：配套 Retain95 的 `TOFU_EVAL.json`，不要填写 SUMMARY。
+- `classifier_model`：本地 gibberish-detector 目录，默认 `models/gibberish-detector`。
+- `retain_size: 3800`：沿用当前 forget05/retain95 设置，训练器仍会核对实际数据数量。
+- `training_gpus: "0,1"` / `evaluation_gpu: "0"`：按服务器空闲 GPU 修改。
+- `evaluation_batch_size: 32`、`learning_rate: 0.00002`：四组共用；改变后属于新的实验配置。
+
+可另存一份自己的配置，并使用 `--config /path/to/pipeline.json`。
+模型和 TOFU 可以使用特征元数据中的 Hub id；本地离线评估会把所有 TOFU 数据配置
+统一指向 `dataset`。分类器和 Retain 参考日志需要在本地准备好。
+本流程固定使用当前的 LLaMA-3.1-8B / forget05、effective batch 20、3 epochs、
+random batch order；它是四种**分组方式**的配对 seed 实验。
+
+### 断点继续和输出位置
+
+同一个 seed 中途失败后，重新运行原命令即可。已完成且保存模型的训练不会重复；
+脚本同时检查全部模型分片和命令成功后写出的 `model_save_complete.json`，避免跳过未写完的模型。
+已完成且来源与四项指标核验通过的评估也会跳过。评估失败会重做该组评估。
+未完成的训练从 Full 模型开始，在新的 `attempt-*` 目录中重跑，旧记录保留。
+**这里是阶段级继续，不是恢复中断训练的 optimizer 状态。**
+
+默认目录：
+
+```text
+artifacts/representation_batching/seed_runs/seed-1/   # 四份清单
+saves/unlearn/tofu/forget05/Llama-3.1-8B-Instruct/representation_npo/seed_runs/seed-1/
+  pipeline_state.json                              # 四组进度、设置与运行路径
+  logs/                                            # 每阶段终端日志
+  R/attempt-0001/                                   # 模型、训练诊断、evals/
+  S/attempt-0001/
+  D/attempt-0001/
+  P/attempt-0001/
+reports/representation_batching/
+  index.html                                       # 原审计总览
+  seed_comparison.html                             # 一张表 + 四指标图
+  seed_comparison.csv                              # seed × metric，列为 R/S/D/P
+  seed_runs.csv                                    # 每次运行的来源与协议
+  seed_comparison.png / .pdf / .svg
+```
+
+同一 seed 有进程锁，避免重复启动。重跑期间若配置、特征、Retain 日志或相关代码改变，
+脚本会停止，而不会混接两个协议；要做新条件，请另设 `output_root` 和 `manifest_root`。
+旧版时间戳目录仍会进入汇总，但不自动被接管或视为本脚本的完成阶段。
+要依次运行 seed 1、2：
+
+```bash
+for seed in 1 2; do
+  bash scripts/representation_batching/run_seed.sh "$seed" || break
+done
+```
+
+### 单独生成跨 seed 表格和图
+
+```bash
+python3 scripts/representation_batching/compare_seeds.py
+```
+
+默认扫描 `saves/unlearn`。也可以重复 `--root` 指定多个目录，或用
+`--results reports/representation_batching/results.json` 读取已生成的汇总。
+`--seeds 0 1 2` 会把尚无记录的 seed 也显示出来。
+
+每个指标一幅子图，横轴为 seed，颜色对应 R/S/D/P。只有同一已核验协议内的点才连线；
+旧版/未核验结果用空心点展示。seed 编号只是独立重复的标签，不代表优化进度。
+缺失值留空、不补零；同一个 seed/arm 的多个完整运行会标记为重复，不自动选最新或最佳。
+为明确选择重复运行，可以将每个选中的运行目录分别作为 `--root` 传入。
+图使用 Matplotlib（项目 requirements 已包含），没有图库时仍会导出表格并提示缺失依赖。
+
+只拿到用户手填的数字时，可使用 `--metrics-csv /path/to/metrics.csv`。
+CSV 列为 `seed,arm,exact_memorization,forget_Q_A_gibberish,forget_quality,model_utility`。
+这种来源始终标记为 `user_reported`，不冒充已核验的服务器结果；与同一 seed/arm 的
+自动采集结果重复时，该单元格留空，需先选择来源。

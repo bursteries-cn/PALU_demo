@@ -1,0 +1,18 @@
+{
+  "features": null,
+  "feature_key": "block_22_question_last",
+  "model": null,
+  "dataset": null,
+  "retain_size": 3800,
+  "retain_logs": "saves/eval/tofu_Llama-3.1-8B-Instruct_retain95/TOFU_EVAL.json",
+  "classifier_model": "models/gibberish-detector",
+  "training_gpus": "0,1",
+  "evaluation_gpu": "0",
+  "evaluation_batch_size": 32,
+  "learning_rate": 0.00002,
+  "output_root": "saves/unlearn/tofu/forget05/Llama-3.1-8B-Instruct/representation_npo/seed_runs",
+  "manifest_root": "artifacts/representation_batching/seed_runs",
+  "report_dir": "reports/representation_batching",
+  "scan_roots": ["saves/unlearn"],
+  "expected_seeds": [0, 1, 2]
+}

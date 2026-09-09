@@ -7,6 +7,7 @@ from omegaconf import DictConfig, OmegaConf
 from evals import get_evaluators
 from model import get_model
 from trainer.utils import seed_everything
+from representation_batching.evaluation_config import set_tofu_dataset_paths, validate_local_tofu_files
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="eval.yaml")
@@ -15,6 +16,12 @@ def main(cfg: DictConfig):
     Args:
         cfg (DictConfig): Config to train
     """
+    dataset_override = cfg.get("tofu_dataset_path")
+    if dataset_override:
+        evaluation = OmegaConf.to_container(cfg.eval, resolve=True)
+        set_tofu_dataset_paths(evaluation, dataset_override)
+        validate_local_tofu_files(evaluation, dataset_override)
+        cfg.eval = OmegaConf.create(evaluation)
     seed_everything(cfg.seed)
     model_cfg = cfg.model
     template_args = model_cfg.template_args
