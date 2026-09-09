@@ -2,6 +2,7 @@
 set -euo pipefail
 
 GPU_IDS="0,1"
+MAIN_PROCESS_PORT="29500"
 MANIFEST_PATH=""
 MODEL_PATH="open-unlearning/tofu_Llama-3.1-8B-Instruct_full"
 MODEL_REVISION=""
@@ -23,6 +24,7 @@ Usage:
 Options:
   --manifest PATH       Required R/S/D/P manifest.
   --gpu IDS             Exactly two comma-separated GPU ids (default: 0,1).
+  --main-process-port N Distributed communication port (default: 29500).
   --model PATH_OR_ID    Full TOFU LLaMA-3.1-8B checkpoint.
   --model-revision REV  Optional immutable model revision.
   --dataset PATH_OR_ID  TOFU dataset path or Hub id.
@@ -40,6 +42,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --manifest) MANIFEST_PATH="$2"; shift 2 ;;
         --gpu) GPU_IDS="$2"; shift 2 ;;
+        --main-process-port) MAIN_PROCESS_PORT="$2"; shift 2 ;;
         --model) MODEL_PATH="$2"; shift 2 ;;
         --model-revision) MODEL_REVISION="$2"; shift 2 ;;
         --dataset) DATASET_PATH="$2"; shift 2 ;;
@@ -86,6 +89,7 @@ COMMAND=(
     accelerate launch
     --config_file configs/accelerate/default_config.yaml
     --num_processes 2
+    --main_process_port "${MAIN_PROCESS_PORT}"
     src/train.py --config-name=unlearn.yaml
     experiment=unlearn/tofu/representation_npo
     "model.model_args.pretrained_model_name_or_path=${MODEL_PATH}"

@@ -1,13 +1,15 @@
 from __future__ import annotations
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from representation_batching.report import build_report, collect_run, summarize, LEGACY_MODEL_LOADER_SHA256
+from representation_batching.report import build_report, collect_run, summarize, LEGACY_MODEL_LOADER_SHA256, report_lock
+from representation_batching.seed_comparison import select_cells
 
 
 def write(path, data):
@@ -50,6 +52,43 @@ def fixture(root, arm="R", seed=0, max_steps=-1, name=None):
 
 
 class ReportTests(unittest.TestCase):
+    def test_timestamp_and_nested_seed_layouts_are_scanned_once_by_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp).resolve()
+            old=fixture(root,'R',0,name='representation_npo_R_seed0_20260909-120000')
+            new=fixture(root/'seed_runs/seed-7/S','S',7,name='attempt-0001')
+            report=build_report({'roots':[str(root),str(root/'seed_runs')],'expected_seeds':[0,1,2]},root/'report')
+            self.assertEqual(len(report['runs']),2)
+            rows={r['run_dir']:r for r in report['runs']}
+            self.assertEqual((rows[str(old)]['seed'],rows[str(old)]['arm']),(0,'R/random'))
+            self.assertEqual((rows[str(new)]['seed'],rows[str(new)]['arm']),(7,'S/random'))
+            self.assertEqual(rows[str(old)]['protocol'],rows[str(new)]['protocol'])
+            wide,_,warnings=select_cells(report['runs'])
+            self.assertFalse(warnings)
+            self.assertEqual(next(r for r in wide if r['seed']==0 and r['metric']=='model_utility')['R'],.6)
+            self.assertEqual(next(r for r in wide if r['seed']==7 and r['metric']=='model_utility')['S'],.6)
+            self.assertTrue(any(r['seed']==7 for r in report['coverage']))
+
+    def test_report_lock_excludes_other_processes_and_releases_after_errors(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out=Path(temp)
+            code='''import fcntl,sys
+with open(sys.argv[1], 'a') as handle:
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print('blocked')
+    else:
+        print('acquired')
+'''
+            def attempt():
+                return subprocess.check_output([sys.executable,'-c',code,str(out/'.report.lock')],text=True).strip()
+            with self.assertRaisesRegex(ValueError,'test failure'):
+                with report_lock(out):
+                    self.assertEqual(attempt(),'blocked')
+                    raise ValueError('test failure')
+            self.assertEqual(attempt(),'acquired')
+
     def legacy_provenance(self, run):
         path=run/'evals/evaluation_provenance.json'
         provenance=json.loads(path.read_text())

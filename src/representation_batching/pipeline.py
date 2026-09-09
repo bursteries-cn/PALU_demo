@@ -13,7 +13,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-from representation_batching.report import METRICS, build_report, collect_run, read_json, write_csv
+from representation_batching.report import METRICS, build_report, collect_run, read_json, write_csv, report_lock, normalize_launch_hash
 from representation_batching.seed_comparison import export_comparison
 from representation_batching.local_dataset import resolve_local_dataset_config
 
@@ -45,7 +45,30 @@ def path_from_root(value,root):
     return (root/path).resolve() if not path.is_absolute() else path.resolve()
 
 
-def load_settings(config_path,root=ROOT):
+def runtime_settings(raw,overrides=None):
+    values=dict(raw)
+    overrides={k:v for k,v in (overrides or {}).items() if v is not None}
+    values.update(overrides)
+    devices=str(values.get("training_gpus","0,1")).split(",")
+    if len(devices)!=2 or any(not d.strip().isascii() or not d.strip().isdigit() for d in devices):
+        raise ValueError("training_gpus 必须是两个 GPU 编号，例如 0,1")
+    devices=[int(d.strip()) for d in devices]
+    if len(set(devices))!=2:
+        raise ValueError("training_gpus 必须是两张不同 GPU，例如 0,1")
+    if "training_gpus" in overrides and "evaluation_gpu" not in overrides:
+        values["evaluation_gpu"]=str(devices[0])
+    evaluation=str(values.get("evaluation_gpu",str(devices[0]))).strip()
+    if not evaluation.isascii() or not evaluation.isdigit():
+        raise ValueError("evaluation_gpu 必须是单个 GPU 编号")
+    port=values.get("main_process_port")
+    port=int(port) if port is not None else 29500+min(devices)
+    if not 1024<=port<=65535:
+        raise ValueError("main_process_port 必须在 1024 到 65535 之间")
+    return {"training_gpus":",".join(map(str,devices)),"evaluation_gpu":str(int(evaluation)),
+            "main_process_port":port}
+
+
+def load_settings(config_path,root=ROOT,overrides=None):
     raw=read_json(config_path)
     settings=dict(raw)
     feature=raw.get("features")
@@ -93,13 +116,7 @@ def load_settings(config_path,root=ROOT):
         missing=[name for name in names if resolve_local_dataset_config(settings["dataset"],name) is None]
         if missing:
             raise ValueError("本地 TOFU 缺少训练/评估数据配置："+", ".join(missing))
-    settings["training_gpus"]=str(raw.get("training_gpus","0,1"))
-    devices=[x.strip() for x in settings["training_gpus"].split(",")]
-    if len(devices)!=2 or len(set(devices))!=2 or any(not x for x in devices):
-        raise ValueError("training_gpus 必须是两张不同 GPU，例如 0,1")
-    settings["evaluation_gpu"]=str(raw.get("evaluation_gpu","0"))
-    if "," in settings["evaluation_gpu"] or not settings["evaluation_gpu"]:
-        raise ValueError("evaluation_gpu 必须是一张 GPU")
+    settings.update(runtime_settings(raw,overrides))
     settings["retain_size"]=int(raw.get("retain_size",3800))
     settings["evaluation_batch_size"]=int(raw.get("evaluation_batch_size",32))
     settings["learning_rate"]=float(raw.get("learning_rate",2e-5))
@@ -114,7 +131,7 @@ def load_settings(config_path,root=ROOT):
 
 def fingerprint_payload(settings,root=ROOT,revision=None):
     # Path/config changes cannot silently resume into a different experiment.
-    effective={k:v for k,v in settings.items() if k not in ("scan_roots","report_dir","expected_seeds","training_gpus","evaluation_gpu")}
+    effective={k:v for k,v in settings.items() if k not in ("scan_roots","report_dir","expected_seeds","training_gpus","evaluation_gpu","main_process_port")}
     directories=("src/trainer","src/data","src/model","src/evals","src/representation_batching","configs/model","configs/trainer","configs/accelerate","configs/data","configs/eval","configs/collator")
     files=("src/train.py","src/eval.py","configs/unlearn.yaml","configs/eval.yaml",
                  "configs/experiment/unlearn/tofu/representation_npo.yaml","configs/experiment/eval/tofu/default.yaml",
@@ -136,7 +153,7 @@ def fingerprint_payload(settings,root=ROOT,revision=None):
 def payload_digest(payload,exclude_controls=True):
     payload=dict(payload)
     if exclude_controls:
-        payload["code"]={k:v for k,v in payload["code"].items() if k not in CONTROL_FILES}
+        payload["code"]={k:normalize_launch_hash(k,v) for k,v in payload["code"].items() if k not in CONTROL_FILES}
         if payload["code"].get("src/eval.py")==EVAL_PROVENANCE_FIX_SHA256:
             payload["code"]["src/eval.py"]=LEGACY_EVAL_SHA256
     return hashlib.sha256(json.dumps(payload,sort_keys=True).encode()).hexdigest()
@@ -169,6 +186,7 @@ def commands(settings,seed,arm,run,root=ROOT):
     train=["bash",str(scripts/"run_npo_representation.sh"),"--manifest",str(manifests/f"{arm}.jsonl"),
         "--gpu",settings["training_gpus"],"--seed",str(seed),"--model",settings["model"],
         "--dataset",settings["dataset"],"--lr",str(settings["learning_rate"]),"--output-dir",str(run)]
+    train += ["--main-process-port",str(runtime_settings(settings)["main_process_port"])]
     for key in ("model","dataset"):
         if settings.get(key+"_revision"):
             train += ["--"+key+"-revision",settings[key+"_revision"]]
@@ -247,8 +265,9 @@ def refresh(settings,seed):
     out=Path(settings["report_dir"])
     roots=list(dict.fromkeys(settings["scan_roots"]+[settings["output_root"]]))
     seeds=sorted(set(settings["expected_seeds"]+[seed]))
-    payload=build_report({"roots":roots,"expected_seeds":seeds},out)
-    _,warnings=export_comparison(payload["runs"],out,seeds)
+    with report_lock(out):
+        payload=build_report({"roots":roots,"expected_seeds":seeds},out)
+        _,warnings=export_comparison(payload["runs"],out,seeds)
     for warning in payload["warnings"]+warnings: print("WARNING:",warning)
     print(f"结果表 / 图：{out/'seed_comparison.html'}",flush=True)
 
@@ -327,6 +346,7 @@ def run_seed(settings,seed,signature,root=ROOT,runner=None,inspector=None,refres
         manifest_root.mkdir(parents=True,exist_ok=True)
         write_state(owner_path,{"signature":signature})
         state["status"]="running"
+        state["runtime"]=runtime_settings(settings)
         state.pop("error",None)
         for arm in ARMS:
             state["arms"].setdefault(arm,{"attempts":[],"status":"pending"})
@@ -404,19 +424,28 @@ def run_seed(settings,seed,signature,root=ROOT,runner=None,inspector=None,refres
     return state
 
 
+def build_parser():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("seed",type=int)
+    parser.add_argument("--config",type=Path,default=ROOT/"configs/analysis/representation_pipeline.json")
+    parser.add_argument("--gpu","--gpus","--training-gpus",dest="training_gpus",help="两张训练 GPU，例如 2,3；覆盖配置文件")
+    parser.add_argument("--eval-gpu","--evaluation-gpu",dest="evaluation_gpu",help="单张评估 GPU；指定 --gpu 后默认使用该组第一张")
+    parser.add_argument("--main-process-port","--port",dest="main_process_port",type=int,help="分布式通信端口；默认 29500 + 较小的训练 GPU 编号")
+    parser.add_argument("--dry-run",action="store_true",help="Validate input paths and print commands without launching jobs or writing state")
+    return parser
+
+
 def main():
     def interrupted(_signal, _frame):
         raise KeyboardInterrupt("Pipeline interrupted")
     signal.signal(signal.SIGTERM,interrupted)
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("seed",type=int)
-    parser.add_argument("--config",type=Path,default=ROOT/"configs/analysis/representation_pipeline.json")
-    parser.add_argument("--dry-run",action="store_true",help="Validate input paths and print commands without launching jobs or writing state")
+    parser=build_parser()
     args=parser.parse_args()
     if args.seed<0: parser.error("seed 必须是非负整数")
     try:
-        settings=load_settings(args.config)
+        settings=load_settings(args.config,overrides={k:getattr(args,k) for k in ("training_gpus","evaluation_gpu","main_process_port")})
         print(f"seed={args.seed}; Full={settings['model']}; TOFU={settings['dataset']}",flush=True)
+        print(f"训练 GPU={settings['training_gpus']}; 评估 GPU={settings['evaluation_gpu']}; port={settings['main_process_port']}",flush=True)
         if args.dry_run:
             for index,arm in enumerate(ARMS):
                 run=Path(settings["output_root"])/f"seed-{args.seed}"/arm/"attempt-0001"

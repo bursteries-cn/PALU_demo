@@ -1,6 +1,7 @@
 from __future__ import annotations
 import importlib.util
 import json
+import os
 import sys
 import subprocess
 import tempfile
@@ -12,10 +13,11 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/"src"))
 from representation_batching.pipeline import (run_seed, commands, hash_file, load_settings,
     saved_model, run_command, inspect_run, save_seed_results, fingerprint,
-    fingerprint_payload, payload_digest, compatible_legacy_signature)
+    fingerprint_payload, payload_digest, compatible_legacy_signature, runtime_settings, build_parser)
 from representation_batching.seed_comparison import select_cells, export_comparison, manual_rows
 from representation_batching.evaluation_config import set_tofu_dataset_paths, validate_local_tofu_files
-from representation_batching.report import LEGACY_MODEL_LOADER_SHA256, METRICS
+from representation_batching.report import (LEGACY_MODEL_LOADER_SHA256, METRICS,
+    PORT_LAUNCHER_SHA256, LEGACY_LAUNCHER_SHA256, normalize_launch_hash)
 from test_report import fixture
 
 
@@ -66,6 +68,83 @@ class ComparisonTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_gpu_cli_overrides_and_automatic_evaluation_gpu_and_port(self):
+        args=build_parser().parse_args(['2','--gpu','2,3'])
+        raw={'training_gpus':'0,1','evaluation_gpu':'0'}
+        values=runtime_settings(raw,{k:getattr(args,k) for k in ('training_gpus','evaluation_gpu','main_process_port')})
+        self.assertEqual(values,{'training_gpus':'2,3','evaluation_gpu':'2','main_process_port':29502})
+        args=build_parser().parse_args(['2','--gpus','4,5','--eval-gpu','5','--port','29604'])
+        values=runtime_settings(raw,{k:getattr(args,k) for k in ('training_gpus','evaluation_gpu','main_process_port')})
+        self.assertEqual(values,{'training_gpus':'4,5','evaluation_gpu':'5','main_process_port':29604})
+        self.assertEqual(raw,{'training_gpus':'0,1','evaluation_gpu':'0'})
+
+    def test_bash_dry_run_routes_overrides_without_writing_config_or_runs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); feature=root/'features.npz'; feature.write_bytes(b'feature metadata fixture')
+            write(root/'feature_manifest.json',{'model':'org/Full','dataset':'org/TOFU',
+                'dataset_config':'forget05','feature_keys':['block_22_question_last'],'feature_sha256':hash_file(feature)})
+            write(root/'classifier/config.json',{})
+            write(root/'retain.json',{'forget_truth_ratio':{'agg_value':1}})
+            cfg=root/'pipeline.json'
+            write(cfg,{'features':str(feature),'classifier_model':str(root/'classifier'),
+                'retain_logs':str(root/'retain.json'),'output_root':str(root/'runs'),
+                'manifest_root':str(root/'manifests'),'training_gpus':'0,1','evaluation_gpu':'0'})
+            before=cfg.read_bytes()
+            completed=subprocess.run(['bash',str(ROOT/'scripts/representation_batching/run_seed.sh'),
+                '7','--config',str(cfg),'--gpu','2,3','--eval-gpu','3','--port','29602','--dry-run'],
+                cwd=root,env={**os.environ,'PYTHON_BIN':sys.executable},capture_output=True,text=True,check=True)
+            self.assertIn('训练 GPU=2,3; 评估 GPU=3; port=29602',completed.stdout)
+            self.assertEqual(completed.stdout.count('--main-process-port 29602'),4)
+            self.assertEqual(completed.stdout.count('--gpu 2,3'),4)
+            self.assertEqual(completed.stdout.count('--gpu 3'),4)
+            self.assertEqual(cfg.read_bytes(),before)
+            self.assertFalse((root/'runs').exists())
+            self.assertFalse((root/'manifests').exists())
+
+    def test_invalid_gpu_layouts_and_ports_are_rejected(self):
+        for value in ('0','0,1,2,3','1,1','01,1','-1,2','x,1','0,'):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                runtime_settings({'training_gpus':value})
+        for overrides in ({'evaluation_gpu':'2,3'},{'main_process_port':0},{'main_process_port':65536}):
+            with self.subTest(overrides=overrides),self.assertRaises(ValueError):
+                runtime_settings({},overrides)
+
+    def test_gpu_and_port_changes_do_not_change_training_signature(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); cfg=settings(root)
+            before=fingerprint(cfg,root)
+            cfg.update(training_gpus='2,3',evaluation_gpu='3',main_process_port=29502)
+            self.assertEqual(before,fingerprint(cfg,root))
+            _,train,evaluate=commands(cfg,2,'R',root/'run')
+            self.assertEqual(train[train.index('--gpu')+1],'2,3')
+            self.assertEqual(train[train.index('--main-process-port')+1],'29502')
+            self.assertEqual(evaluate[evaluate.index('--gpu')+1],'3')
+            cfg['learning_rate']=9e-5
+            self.assertNotEqual(before,fingerprint(cfg,root))
+
+    def test_shell_passes_gpu_and_port_to_accelerate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); manifest=root/'R.jsonl'; manifest.write_text('manifest')
+            fake=root/'accelerate'
+            fake.write_text('#!'+sys.executable+'\nimport json,os,sys\nprint(json.dumps({"args":sys.argv[1:],"gpus":os.environ.get("CUDA_VISIBLE_DEVICES")}))\n')
+            fake.chmod(0o755)
+            result=subprocess.run(['bash',str(ROOT/'scripts/representation_batching/run_npo_representation.sh'),
+                '--manifest',str(manifest),'--gpu','2,3','--main-process-port','29502','--no-save'],
+                cwd=ROOT,env={**os.environ,'PATH':str(root)+os.pathsep+os.environ['PATH']},
+                check=True,capture_output=True,text=True)
+            payload=json.loads(result.stdout)
+            self.assertEqual(payload['gpus'],'2,3')
+            args=payload['args']; index=args.index('--main_process_port')
+            self.assertEqual(args[index+1],'29502')
+            self.assertLess(index,args.index('src/train.py'))
+            self.assertIn('do_save=false',args)
+
+    def test_only_known_port_launcher_change_has_the_same_protocol_hash(self):
+        name='scripts/representation_batching/run_npo_representation.sh'
+        self.assertEqual(hash_file(ROOT/name),PORT_LAUNCHER_SHA256)
+        self.assertEqual(normalize_launch_hash(name,PORT_LAUNCHER_SHA256),LEGACY_LAUNCHER_SHA256)
+        self.assertEqual(normalize_launch_hash(name,'changed optimizer flags'),'changed optimizer flags')
+
     def test_existing_r_with_legacy_provenance_is_reused_before_s_d_p(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp); cfg=settings(root); seed_root=root/'runs/seed-2'

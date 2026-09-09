@@ -315,6 +315,37 @@ S 训练与评估 → D 训练与评估 → P 训练与评估 → 更新总览�
 脚本返回非零退出码并列出失败项。清单生成失败或手动中断则立即停止。
 只想预览路径与命令时，在末尾加 `--dry-run`；它不会创建运行目录或启动模型。
 
+### 在不同 GPU 组上手动并行多个 seed
+
+在两个终端（或两个 tmux 窗口）分别启动：
+
+```bash
+# 终端 1：seed 1，训练 GPU 0、1，评估 GPU 0
+bash scripts/representation_batching/run_seed.sh 1 --gpu 0,1
+
+# 终端 2：seed 2，训练 GPU 2、3，评估 GPU 2
+bash scripts/representation_batching/run_seed.sh 2 --gpu 2,3
+```
+
+参数含义：
+
+- `--gpu`（别名 `--gpus` / `--training-gpus`）：两张 GPU 的编号，覆盖配置文件。
+- `--eval-gpu`：单张评估 GPU；指定 `--gpu` 且不提供此参数时，自动使用该组的第一张，
+  例如 `--gpu 2,3` 默认评估 GPU 2，不会继续使用配置文件里的 GPU 0。
+- `--port`（别名 `--main-process-port`）：分布式通信端口，默认 `29500 + 两张训练 GPU 中较小的编号`。
+  上述两组分别使用 29500、29502；若端口已被其他作业占用，可显式换一个。
+  此参数传给 Accelerate 的 [`--main_process_port`](https://huggingface.co/docs/accelerate/v0.34.2/en/package_reference/cli#accelerate-launch)。
+
+```bash
+bash scripts/representation_batching/run_seed.sh 3 --gpu 4,5 --eval-gpu 5 --port 29605
+```
+
+这些编号直接用于 `CUDA_VISIBLE_DEVICES`。手动并行时为各任务分配不重叠的 GPU；
+每个 seed 内的 R/S/D/P 仍串行执行，训练仍固定使用两卡与 effective batch 20。
+同一 seed 的重复启动会被进程锁阻止，不支持用多个 `run_seed.sh` 实例拆分同一 seed。
+GPU 编号和端口变化不会阻止阶段续跑；实际值会记录在 `pipeline_state.json` 的 `runtime` 中。
+多个 seed 完成时会依次获取总报告写入锁，避免 CSV/图被同时覆盖；该锁不会串行化训练。
+
 ### 首次运行的路径配置
 
 集中配置文件是 `configs/analysis/representation_pipeline.json`。
@@ -399,6 +430,22 @@ done
 
 ```bash
 python3 scripts/representation_batching/compare_seeds.py
+```
+
+新旧目录**不需要改名或搬迁**。扫描器递归查找 `batch_audit/`，从归档清单读取
+seed 和 R/S/D/P，而不是解析外层文件夹名称，因此以下两种布局会同时识别：
+
+```text
+representation_npo/representation_npo_R_seed0_时间戳/batch_audit/
+representation_npo/seed_runs/seed-2/R/attempt-0001/batch_audit/
+```
+
+各运行的 `evals/TOFU_SUMMARY.json`、来源记录及训练归档应一同保留。
+默认扫描 `saves/unlearn` 已覆盖这两种默认布局。模型权重不参与报表扫描。
+如果曾把结果放到默认范围之外，可在同一次汇总中重复指定 `--root`：
+
+```bash
+python3 scripts/representation_batching/compare_seeds.py --root /path/to/old_runs --root /path/to/new_runs
 ```
 
 默认扫描 `saves/unlearn`。也可以重复 `--root` 指定多个目录，或用

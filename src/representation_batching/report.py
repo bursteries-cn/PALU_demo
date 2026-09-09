@@ -3,18 +3,43 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import hashlib
 import html
 import json
 import math
 import statistics
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 
 METRICS = ("forget_quality", "model_utility", "forget_Q_A_gibberish", "exact_memorization")
 DIAGNOSTICS = ("forget_loss", "retain_loss", "npo_weight_mean", "npo_weight_near_zero_fraction")
 # This archived loader removes exactly path and dtype from the caller's config.
 LEGACY_MODEL_LOADER_SHA256 = "0752bcf4993e4b1ed24964034460a7ccf2f21122a7de0052c61f5fe8e18f839b"
+PORT_LAUNCHER_SHA256 = "9b229a083f4e5de5ff308076a9e585f0c913bff000bda7600b936df64b1ade27"
+LEGACY_LAUNCHER_SHA256 = "80ccb43431130cb498287a7d328386db6a1dee1cc83895c08dc1ae369e255cb0"
+
+
+def normalize_launch_hash(name, value):
+    # Exactly the reviewed port-argument addition; do not ignore later changes
+    # to training flags, model initialization, data, or optimization settings.
+    if name == "scripts/representation_batching/run_npo_representation.sh" and value == PORT_LAUNCHER_SHA256:
+        return LEGACY_LAUNCHER_SHA256
+    return value
+
+
+@contextmanager
+def report_lock(out):
+    """Serialize a full report refresh across concurrent seeds and CLI tools."""
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / ".report.lock").open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def read_json(path):
@@ -66,7 +91,7 @@ def training_protocol(config, meta, run):
     runtime_path = run / "batch_audit/runtime_contract.json"
     runtime = read_json(runtime_path) if runtime_path.exists() else {}
     snapshot = run / "batch_audit/code_snapshot"
-    code = {str(p.relative_to(snapshot)): hashlib.sha256(p.read_bytes()).hexdigest()
+    code = {str(p.relative_to(snapshot)): normalize_launch_hash(str(p.relative_to(snapshot)), hashlib.sha256(p.read_bytes()).hexdigest())
             for p in sorted(snapshot.rglob("*")) if p.is_file()}
     return digest({
         "model": config.get("model"), "data": config.get("data"),
@@ -368,8 +393,9 @@ def build_report(config, out):
             warnings.append(f"{run}: {exc}")
     aggregates, pairs = summarize(rows, config.get("reference_arm", "R/random"), warnings)
     coverage = []
+    seeds = sorted(set(config.get("expected_seeds", [0, 1, 2])) | {r["seed"] for r in rows})
     for arm in config.get("expected_arms", ["R/random", "S/random", "D/random", "P/random"]):
-        for seed in config.get("expected_seeds", [0, 1, 2]):
+        for seed in seeds:
             matches = [r for r in rows if r["arm"] == arm and r["seed"] == seed]
             coverage.append(dict(arm=arm, seed=seed, runs=len(matches),
                 eligible=sum(r["eligible"] for r in matches),
@@ -434,7 +460,8 @@ def main():
             link[key] = resolve(link[key])
     for baseline in config.get("baselines", []):
         baseline["summary"] = resolve(baseline["summary"])
-    payload = build_report(config, args.out.resolve())
+    with report_lock(args.out.resolve()):
+        payload = build_report(config, args.out.resolve())
     print(f"Report: {args.out.resolve() / 'index.html'}")
     print(f"Runs: {len(payload['runs'])}; warnings: {len(payload['warnings'])}")
 

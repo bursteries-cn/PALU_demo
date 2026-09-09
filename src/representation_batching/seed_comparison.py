@@ -6,7 +6,7 @@ import html
 import json
 from collections import defaultdict
 from pathlib import Path
-from representation_batching.report import METRICS, build_report, finite, fmt, read_json, write_csv
+from representation_batching.report import METRICS, build_report, finite, fmt, read_json, write_csv, report_lock
 
 ARMS = ("R", "S", "D", "P")
 LABELS = {"exact_memorization": "Exact memorization",
@@ -146,19 +146,20 @@ def main():
     args=parser.parse_args()
     if args.results and args.root:
         parser.error("Use --results or --root, not both")
-    if args.results:
-        rows=read_json(args.results)["runs"]
-    elif args.root or not args.metrics_csv:
-        roots=args.root or [Path("saves/unlearn")]
-        payload=build_report({"roots":[str(p.resolve()) for p in roots],"expected_seeds":args.seeds or [0,1,2]},args.out.resolve())
-        rows=payload["runs"]
-        for warning in payload["warnings"]:
-            print("WARNING:",warning)
-    else:
-        rows=[]
-    if args.metrics_csv:
-        rows+=manual_rows(args.metrics_csv)
-    wide,warnings=export_comparison(rows,args.out,args.seeds,not args.no_plot)
+    with report_lock(args.out):
+        if args.results:
+            rows=read_json(args.results)["runs"]
+        elif args.root or not args.metrics_csv:
+            roots=args.root or [Path("saves/unlearn")]
+            payload=build_report({"roots":[str(p.resolve()) for p in roots],"expected_seeds":args.seeds or [0,1,2]},args.out.resolve())
+            rows=payload["runs"]
+            for warning in payload["warnings"]:
+                print("WARNING:",warning)
+        else:
+            rows=[]
+        if args.metrics_csv:
+            rows+=manual_rows(args.metrics_csv)
+        wide,warnings=export_comparison(rows,args.out,args.seeds,not args.no_plot)
     print("seed\tmetric\tR\tS\tD\tP")
     for row in wide:
         print('\t'.join(fmt(row[k]) for k in ("seed","metric",*ARMS)))
