@@ -129,7 +129,7 @@ class PipelineTests(unittest.TestCase):
             fake.write_text('#!'+sys.executable+'\nimport json,os,sys\nprint(json.dumps({"args":sys.argv[1:],"gpus":os.environ.get("CUDA_VISIBLE_DEVICES")}))\n')
             fake.chmod(0o755)
             result=subprocess.run(['bash',str(ROOT/'scripts/representation_batching/run_npo_representation.sh'),
-                '--manifest',str(manifest),'--gpu','2,3','--main-process-port','29502','--no-save'],
+                '--manifest',str(manifest),'--gpu','2,3','--main-process-port','29502','--epochs','10','--no-save'],
                 cwd=ROOT,env={**os.environ,'PATH':str(root)+os.pathsep+os.environ['PATH']},
                 check=True,capture_output=True,text=True)
             payload=json.loads(result.stdout)
@@ -138,12 +138,69 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(args[index+1],'29502')
             self.assertLess(index,args.index('src/train.py'))
             self.assertIn('do_save=false',args)
+            self.assertIn('trainer.args.num_train_epochs=10',args)
 
     def test_only_known_port_launcher_change_has_the_same_protocol_hash(self):
         name='scripts/representation_batching/run_npo_representation.sh'
-        self.assertEqual(hash_file(ROOT/name),PORT_LAUNCHER_SHA256)
         self.assertEqual(normalize_launch_hash(name,PORT_LAUNCHER_SHA256),LEGACY_LAUNCHER_SHA256)
         self.assertEqual(normalize_launch_hash(name,'changed optimizer flags'),'changed optimizer flags')
+        # The epoch-capable launcher is deliberately not covered by the old
+        # port-only exemption. Numerical cohort validation stays conservative.
+        self.assertNotEqual(hash_file(ROOT/name),PORT_LAUNCHER_SHA256)
+        self.assertEqual(normalize_launch_hash(name,hash_file(ROOT/name)),hash_file(ROOT/name))
+
+    def test_epochs_cli_routes_to_both_stages_and_isolates_existing_results(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); feature=root/'features.npz'; feature.write_bytes(b'feature fixture')
+            write(root/'feature_manifest.json',{'model':'org/Full','dataset':'org/TOFU',
+                'dataset_config':'forget05','feature_keys':['block_22_question_last'],'feature_sha256':hash_file(feature)})
+            write(root/'classifier/config.json',{})
+            write(root/'retain.json',{'forget_truth_ratio':{'agg_value':1}})
+            cfg=root/'pipeline.json'
+            write(cfg,{'features':str(feature),'classifier_model':str(root/'classifier'),
+                'retain_logs':str(root/'retain.json'),'output_root':str(root/'runs'),
+                'manifest_root':str(root/'manifests'),'report_dir':str(root/'report'),'num_epochs':5})
+            before=cfg.read_bytes()
+            default=load_settings(cfg,root,overrides={'num_epochs':3})
+            ten=load_settings(cfg,root,overrides={'num_epochs':10})
+            self.assertEqual(default['output_root'],str((root/'runs').resolve()))
+            self.assertEqual(ten['output_root'],str((root/'runs/epochs-10').resolve()))
+            self.assertEqual(ten['manifest_root'],str((root/'manifests/epochs-10').resolve()))
+            self.assertEqual(ten['report_dir'],str((root/'report/epochs-10').resolve()))
+            self.assertEqual(ten['scan_roots'],[ten['output_root']])
+            self.assertNotEqual(fingerprint(default,root),fingerprint(ten,root))
+            self.assertEqual(load_settings(cfg,root)['num_epochs'],5)
+            for arm in ('R','S','D','P'):
+                build,train,_=commands(ten,2,arm,root/'new-run',root)
+                self.assertEqual(build[build.index('--num-epochs')+1],'10')
+                self.assertEqual(train[train.index('--epochs')+1],'10')
+                self.assertEqual(train[train.index('--model')+1],'org/Full')
+                self.assertIn('epochs-10',build[build.index('--output-dir')+1])
+            result=subprocess.run(['bash',str(ROOT/'scripts/representation_batching/run_seed.sh'),
+                '2','--config',str(cfg),'--epochs','10','--dry-run'],
+                env={**os.environ,'PYTHON_BIN':sys.executable},capture_output=True,text=True,check=True)
+            self.assertEqual(result.stdout.count('--num-epochs 10'),1)
+            self.assertEqual(result.stdout.count('--epochs 10'),4)
+            self.assertEqual(cfg.read_bytes(),before)
+            self.assertFalse((root/'runs').exists())
+            for value in (0,-1,1.5,True,'invalid'):
+                with self.subTest(value=value),self.assertRaisesRegex(ValueError,'正整数'):
+                    load_settings(cfg,root,overrides={'num_epochs':value})
+
+    def test_default_commands_keep_three_epochs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            build,train,_=commands(settings(root),0,'R',root/'run')
+            self.assertEqual(build[build.index('--num-epochs')+1],'3')
+            self.assertEqual(train[train.index('--epochs')+1],'3')
+
+    def test_single_run_rejects_invalid_epochs_before_launch(self):
+        launcher=str(ROOT/'scripts/representation_batching/run_npo_representation.sh')
+        for value in ('0','-1','1.5','abc'):
+            with self.subTest(value=value):
+                result=subprocess.run(['bash',launcher,'--epochs',value],capture_output=True,text=True)
+                self.assertEqual(result.returncode,2)
+                self.assertIn('positive integer',result.stderr)
 
     def test_existing_r_with_legacy_provenance_is_reused_before_s_d_p(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -11,6 +11,7 @@ DATASET_REVISION=""
 OUTPUT_ROOT="./saves/unlearn/tofu/forget05/Llama-3.1-8B-Instruct/representation_npo"
 EXACT_OUTPUT_DIR=""
 LEARNING_RATE="2e-5"
+NUM_EPOCHS="3"
 SEED="0"
 MAX_STEPS="-1"
 DO_SAVE="true"
@@ -32,6 +33,7 @@ Options:
   --output-root PATH    Parent output directory.
   --output-dir PATH     Exact NEW run directory (used by run_seed.sh).
   --lr VALUE            Learning rate (default: 2e-5).
+  --epochs INT          Full training epochs; must match manifest (default: 3).
   --seed INT            Training seed; should match the manifest seed.
   --max-steps INT       Stop after this many optimizer steps; use 2 for smoke.
   --no-save             Run without saving the final model (smoke tests only).
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
         --output-dir) EXACT_OUTPUT_DIR="$2"; shift 2 ;;
         --lr) LEARNING_RATE="$2"; shift 2 ;;
+        --epochs) NUM_EPOCHS="$2"; shift 2 ;;
         --seed) SEED="$2"; shift 2 ;;
         --max-steps) MAX_STEPS="$2"; shift 2 ;;
         --no-save) DO_SAVE="false"; shift ;;
@@ -57,6 +60,11 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
     esac
 done
+
+if [[ ! "${NUM_EPOCHS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--epochs must be a positive integer" >&2
+    exit 2
+fi
 
 if [[ -z "${MANIFEST_PATH}" || ! -f "${MANIFEST_PATH}" ]]; then
     echo "--manifest must point to an existing JSONL manifest" >&2
@@ -98,6 +106,7 @@ COMMAND=(
     "data.retain.TOFU_QA_retain.args.hf_args.path=${DATASET_PATH}"
     "trainer.method_args.batch_manifest_path=${MANIFEST_PATH}"
     "trainer.args.learning_rate=${LEARNING_RATE}"
+    "trainer.args.num_train_epochs=${NUM_EPOCHS}"
     "trainer.args.seed=${SEED}"
     "trainer.args.max_steps=${MAX_STEPS}"
     "trainer.args.run_name=${TASK_NAME}"

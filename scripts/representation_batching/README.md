@@ -315,6 +315,35 @@ S 训练与评估 → D 训练与评估 → P 训练与评估 → 更新总览�
 脚本返回非零退出码并列出失败项。清单生成失败或手动中断则立即停止。
 只想预览路径与命令时，在末尾加 `--dry-run`；它不会创建运行目录或启动模型。
 
+### 修改训练轮数
+
+默认仍为 3 个 epoch。通过 `--epochs` 同时改变四组清单的轮数和训练轮数：
+
+```bash
+# 先检查路径和命令；不加载模型、不创建运行目录
+bash scripts/representation_batching/run_seed.sh 0 --epochs 10 --gpu 0,1 --dry-run
+
+# seed 0：R/S/D/P 各自从原始 Full 模型训练 10 个 epoch，再分别评估
+bash scripts/representation_batching/run_seed.sh 0 --epochs 10 --gpu 0,1
+```
+
+`--epochs` 优先于 `configs/analysis/representation_pipeline.json` 中的
+`num_epochs`，要求正整数。不提供时沿用配置（默认 3）。对于非 3 轮实验，
+流水线会在配置的 `output_root`、`manifest_root` 和 `report_dir` 后分别增加
+`epochs-N` 子目录，例如 `seed_runs/epochs-10/seed-0/`。自动生成的报告只扫描
+该轮数的输出目录，避免同一个 seed 的 3 轮和 10 轮结果被当作重复运行。
+需要全局台账时，可另外用 `summarize_results.py --root saves/unlearn` 扫描所有结果。
+
+这会从 Full 重新开始完整的 10 轮实验，不是在旧 3 轮模型上继续 7 轮。
+特征文件继续复用。200 条 Forget、有效 batch 20 时，每轮 10 次参数更新，
+3/10/20 轮分别是 30/100/200 次更新；增大轮数不会增加独立样本数量。
+当前仍只评估最终模型，不自动提供每个 epoch 的评估曲线。
+
+若单独调用训练启动器，也可以使用 `--epochs 10`，但必须先用
+`build_batch_manifests.py --num-epochs 10` 生成新的完整清单，并通过
+`--manifest` 指向该清单；训练器会拒绝轮数不匹配。单独启动器沿用自己的
+`--output-root` / `--output-dir` 规则，自动按轮数隔离目录是 `run_seed.sh` 的功能。
+
 ### 在不同 GPU 组上手动并行多个 seed
 
 在两个终端（或两个 tmux 窗口）分别启动：

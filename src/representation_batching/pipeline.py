@@ -117,6 +117,17 @@ def load_settings(config_path,root=ROOT,overrides=None):
         if missing:
             raise ValueError("本地 TOFU 缺少训练/评估数据配置："+", ".join(missing))
     settings.update(runtime_settings(raw,overrides))
+    requested_epochs=(overrides or {}).get("num_epochs")
+    if requested_epochs is None:
+        requested_epochs=raw.get("num_epochs",3)
+    if isinstance(requested_epochs,bool) or not str(requested_epochs).isascii() or not str(requested_epochs).isdigit() or int(requested_epochs)<=0:
+        raise ValueError("num_epochs / --epochs 必须是正整数")
+    settings["num_epochs"]=int(requested_epochs)
+    # A new epoch budget is a separate experiment, never a continuation of the
+    # previous final model or a replacement of its three-epoch manifest.
+    if settings["num_epochs"]!=3:
+        for key in ("output_root","manifest_root","report_dir"):
+            settings[key]=str(Path(settings[key])/f"epochs-{settings['num_epochs']}")
     settings["retain_size"]=int(raw.get("retain_size",3800))
     settings["evaluation_batch_size"]=int(raw.get("evaluation_batch_size",32))
     settings["learning_rate"]=float(raw.get("learning_rate",2e-5))
@@ -125,6 +136,8 @@ def load_settings(config_path,root=ROOT,overrides=None):
     settings["feature_sha256"]=actual_hash
     settings["retain_sha256"]=hash_file(settings["retain_logs"])
     settings["scan_roots"]=[str(path_from_root(p,root)) for p in raw.get("scan_roots",["saves/unlearn"])]
+    if settings["num_epochs"]!=3:
+        settings["scan_roots"]=[settings["output_root"]]
     settings["expected_seeds"]=[int(s) for s in raw.get("expected_seeds",[0,1,2])]
     return settings
 
@@ -182,10 +195,11 @@ def commands(settings,seed,arm,run,root=ROOT):
     build=[sys.executable,str(scripts/"build_batch_manifests.py"),"--features",settings["features"],
         "--feature-key",settings["feature_key"],"--output-dir",str(manifests),"--retain-size",str(settings["retain_size"]),
         "--effective-batch-size","20","--world-size","2","--per-device-batch-size","1",
-        "--gradient-accumulation-steps","10","--num-epochs","3","--seed",str(seed)]
+        "--gradient-accumulation-steps","10","--num-epochs",str(settings.get("num_epochs",3)),"--seed",str(seed)]
     train=["bash",str(scripts/"run_npo_representation.sh"),"--manifest",str(manifests/f"{arm}.jsonl"),
         "--gpu",settings["training_gpus"],"--seed",str(seed),"--model",settings["model"],
-        "--dataset",settings["dataset"],"--lr",str(settings["learning_rate"]),"--output-dir",str(run)]
+        "--dataset",settings["dataset"],"--lr",str(settings["learning_rate"]),
+        "--epochs",str(settings.get("num_epochs",3)),"--output-dir",str(run)]
     train += ["--main-process-port",str(runtime_settings(settings)["main_process_port"])]
     for key in ("model","dataset"):
         if settings.get(key+"_revision"):
@@ -431,6 +445,7 @@ def build_parser():
     parser.add_argument("--gpu","--gpus","--training-gpus",dest="training_gpus",help="两张训练 GPU，例如 2,3；覆盖配置文件")
     parser.add_argument("--eval-gpu","--evaluation-gpu",dest="evaluation_gpu",help="单张评估 GPU；指定 --gpu 后默认使用该组第一张")
     parser.add_argument("--main-process-port","--port",dest="main_process_port",type=int,help="分布式通信端口；默认 29500 + 较小的训练 GPU 编号")
+    parser.add_argument("--epochs",dest="num_epochs",type=int,help="完整训练轮数；同时用于生成清单和训练，覆盖配置中的 num_epochs（默认 3）")
     parser.add_argument("--dry-run",action="store_true",help="Validate input paths and print commands without launching jobs or writing state")
     return parser
 
@@ -443,8 +458,9 @@ def main():
     args=parser.parse_args()
     if args.seed<0: parser.error("seed 必须是非负整数")
     try:
-        settings=load_settings(args.config,overrides={k:getattr(args,k) for k in ("training_gpus","evaluation_gpu","main_process_port")})
+        settings=load_settings(args.config,overrides={k:getattr(args,k) for k in ("training_gpus","evaluation_gpu","main_process_port","num_epochs")})
         print(f"seed={args.seed}; Full={settings['model']}; TOFU={settings['dataset']}",flush=True)
+        print(f"epochs={settings['num_epochs']}; 输出目录={settings['output_root']}",flush=True)
         print(f"训练 GPU={settings['training_gpus']}; 评估 GPU={settings['evaluation_gpu']}; port={settings['main_process_port']}",flush=True)
         if args.dry_run:
             for index,arm in enumerate(ARMS):

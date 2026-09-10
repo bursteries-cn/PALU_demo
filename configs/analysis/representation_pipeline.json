@@ -10,6 +10,7 @@
   "evaluation_gpu": "0",
   "evaluation_batch_size": 32,
   "learning_rate": 0.00002,
+  "num_epochs": 3,
   "output_root": "saves/unlearn/tofu/forget05/Llama-3.1-8B-Instruct/representation_npo/seed_runs",
   "manifest_root": "artifacts/representation_batching/seed_runs",
   "report_dir": "reports/representation_batching",
