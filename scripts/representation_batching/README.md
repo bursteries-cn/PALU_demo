@@ -137,9 +137,11 @@ done
 ```
 
 The default is full-parameter NPO plus retain NLL, beta 0.1, learning rate
-2e-5, three epochs, constant schedule, bf16, and gradient checkpointing. The
-launcher saves only the final model. Set `WANDB_MODE=online` if desired; offline
-logging is the default.
+2e-5, three epochs, constant schedule, bf16, gradient checkpointing, and global
+gradient clipping at 1.0. The DeepSpeed config must keep
+`gradient_clipping: "auto"`; Accelerate delegates clipping to DeepSpeed, whose
+default for an omitted key is zero. The launcher saves only the final model.
+Set `WANDB_MODE=online` if desired; offline logging is the default.
 
 Run the repository's TOFU evaluator separately on one GPU after training. The
 current custom evaluator intentionally skips multi-process execution. Full,
@@ -169,6 +171,8 @@ At smoke time verify in both rank logs:
   adding retain loss;
 - NPO weight near 1 at initialization;
 - the feature file hash and resolved Hydra config are archived with the run.
+- `runtime_contract.json` records matching `max_grad_norm` and resolved
+  `deepspeed_gradient_clipping` values.
 
 If the 8B active model plus frozen reference does not fit under this ZeRO-3
 configuration, record the peak-memory failure and revise the resource setting.

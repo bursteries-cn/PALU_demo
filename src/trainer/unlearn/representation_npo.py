@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import logging
+import math
 import platform
 import shutil
 import subprocess
@@ -72,11 +73,48 @@ class RepresentationNPO(NPO):
         self.npo_near_zero_threshold = float(npo_near_zero_threshold)
         self.verify_feature_hash = bool(verify_feature_hash)
         super().__init__(*args, **kwargs)
+        self._validate_deepspeed_gradient_clipping()
         self._validate_manifest_against_runtime()
         self._archive_manifest()
         self._expected_rank_microbatches = self._build_expected_rank_microbatches()
         self._observed_microbatch_count = 0
         self._diagnostic_buffer = {}
+
+    def _deepspeed_gradient_clipping(self):
+        if not self.is_deepspeed_enabled:
+            return None
+        plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+        config = getattr(plugin, "deepspeed_config", None)
+        if not isinstance(config, dict):
+            return None
+        return config.get("gradient_clipping")
+
+    def _validate_deepspeed_gradient_clipping(self):
+        """Ensure the Trainer clipping contract is active under DeepSpeed.
+
+        Accelerate delegates clipping to DeepSpeed and does not call
+        ``torch.nn.utils.clip_grad_norm_`` in this mode. DeepSpeed defaults a
+        missing ``gradient_clipping`` entry to 0, so omitting the key silently
+        disables ``TrainingArguments.max_grad_norm``.
+        """
+        if not self.is_deepspeed_enabled or float(self.args.max_grad_norm) <= 0:
+            return
+        expected = float(self.args.max_grad_norm)
+        configured = self._deepspeed_gradient_clipping()
+        try:
+            configured = float(configured)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "DeepSpeed gradient_clipping must resolve to "
+                f"TrainingArguments.max_grad_norm={expected}; got {configured!r}. "
+                "Set gradient_clipping to 'auto' in the DeepSpeed config."
+            ) from exc
+        if not math.isclose(configured, expected, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                f"DeepSpeed gradient_clipping={configured} does not match "
+                f"TrainingArguments.max_grad_norm={expected}. Set the DeepSpeed "
+                "value to 'auto' so Transformers resolves one clipping threshold."
+            )
 
     def _validate_manifest_against_runtime(self):
         metadata = self.batch_manifest.metadata
@@ -168,6 +206,8 @@ class RepresentationNPO(NPO):
             "per_device_batch_size": int(self.args.per_device_train_batch_size),
             "gradient_accumulation_steps": int(self.args.gradient_accumulation_steps),
             "num_train_epochs": float(self.args.num_train_epochs),
+            "max_grad_norm": float(self.args.max_grad_norm),
+            "deepspeed_gradient_clipping": self._deepspeed_gradient_clipping(),
             "environment": {
                 "python": sys.version,
                 "platform": platform.platform(),
