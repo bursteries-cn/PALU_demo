@@ -368,6 +368,10 @@ bash scripts/representation_batching/run_seed.sh 2 --gpu 2,3
 - `--port`（别名 `--main-process-port`）：分布式通信端口，默认 `29500 + 两张训练 GPU 中较小的编号`。
   上述两组分别使用 29500、29502；若端口已被其他作业占用，可显式换一个。
   此参数传给 Accelerate 的 [`--main_process_port`](https://huggingface.co/docs/accelerate/v0.34.2/en/package_reference/cli#accelerate-launch)。
+- 默认在单卡评估成功、四项指标和来源核验通过后删除最终模型权重，保留训练审计、日志、
+  `TOFU_EVAL.json`、`TOFU_SUMMARY.json` 和汇总结果。需要保留某个 seed 的四组模型时加
+  `--keep-model`；`--no-save` / `--no-keep-model` 可显式要求评估后删除，也可在集中配置中
+  设置 `"keep_model_weights": true`。
 
 ```bash
 bash scripts/representation_batching/run_seed.sh 3 --gpu 4,5 --eval-gpu 5 --port 29605
@@ -394,6 +398,7 @@ GPU 编号和端口变化不会阻止阶段续跑；实际值会记录在 `pipel
 - `retain_size: 3800`：沿用当前 forget05/retain95 设置，训练器仍会核对实际数据数量。
 - `training_gpus: "0,1"` / `evaluation_gpu: "0"`：按服务器空闲 GPU 修改。
 - `evaluation_batch_size: 32`、`learning_rate: 0.00002`：四组共用；改变后属于新的实验配置。
+- `keep_model_weights: false`：评估成功后删除最终权重。该项只控制产物保留，不改变训练或评估数值协议。
 
 可另存一份自己的配置，并使用 `--config /path/to/pipeline.json`。
 模型和 TOFU 可以使用特征元数据中的 Hub id；本地离线评估会把所有 TOFU 数据配置
@@ -403,9 +408,12 @@ random batch order；它是四种**分组方式**的配对 seed 实验。
 
 ### 断点继续和输出位置
 
-同一个 seed 中途失败后，重新运行原命令即可。已完成且保存模型的训练不会重复；
+同一个 seed 中途失败后，重新运行原命令即可。已完成且有完整模型、或已有评估与权重清理标记的训练不会重复；
 脚本同时检查全部模型分片和命令成功后写出的 `model_save_complete.json`，避免跳过未写完的模型。
 已完成且来源与四项指标核验通过的评估也会跳过。评估失败会重做该组评估。
+默认情况下，权重只保留到评估核验成功；随后写入 `model_weights_discarded.json` 并删除权重分片。
+该标记与完整评估共同用于断点继续，因此重跑命令不会重新训练已经成功且已清理权重的组。
+评估失败时不会删除权重，以便下次只重做评估。旧运行若没有记录这一保留策略，不会被自动清理。
 评估 JSON 缺失或损坏不会把已完成训练误判为需要重训。
 旧版若出现 `评估返回，但四个完整指标/来源核验未通过`，可能是来源记录丢失模型路径：
 `get_model()` 会原地移除 `pretrained_model_name_or_path` 和 `torch_dtype`，
@@ -431,7 +439,8 @@ saves/unlearn/tofu/forget05/Llama-3.1-8B-Instruct/representation_npo/seed_runs/s
   pipeline_state.json                              # 四组进度、设置与运行路径
   seed_results.csv / seed_results.json              # 本 seed 四组结果与文件入口，实时更新
   logs/                                            # 每阶段终端日志
-  R/attempt-0001/                                   # 模型、训练诊断、evals/
+  R/attempt-0001/                                   # 训练诊断、evals/；默认评估后移除权重
+    model_weights_discarded.json                     # 权重清理完成记录
     evals/TOFU_SUMMARY.json                         # EM / Fluency / FQ / MU 四项汇总
     evals/TOFU_EVAL.json                            # 指标计算缓存与样本级评估记录
   S/attempt-0001/

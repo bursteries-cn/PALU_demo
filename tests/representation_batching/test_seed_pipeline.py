@@ -12,7 +12,7 @@ from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/"src"))
 from representation_batching.pipeline import (run_seed, commands, hash_file, load_settings,
-    saved_model, run_command, inspect_run, save_seed_results, fingerprint,
+    saved_model, discarded_model, discard_model_weights, run_command, inspect_run, save_seed_results, fingerprint,
     fingerprint_payload, payload_digest, compatible_legacy_signature, runtime_settings, build_parser)
 from representation_batching.seed_comparison import select_cells, export_comparison, manual_rows
 from representation_batching.evaluation_config import set_tofu_dataset_paths, validate_local_tofu_files
@@ -194,6 +194,13 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(build[build.index('--num-epochs')+1],'3')
             self.assertEqual(train[train.index('--epochs')+1],'3')
 
+    def test_model_retention_cli_aliases(self):
+        parser=build_parser()
+        self.assertIsNone(parser.parse_args(['0']).keep_model_weights)
+        self.assertTrue(parser.parse_args(['0','--keep-model']).keep_model_weights)
+        for flag in ('--discard-model-after-eval','--no-keep-model','--no-save'):
+            self.assertFalse(parser.parse_args(['0',flag]).keep_model_weights)
+
     def test_single_run_rejects_invalid_epochs_before_launch(self):
         launcher=str(ROOT/'scripts/representation_batching/run_npo_representation.sh')
         for value in ('0','-1','1.5','abc'):
@@ -262,6 +269,29 @@ class PipelineTests(unittest.TestCase):
             (run/'part2.safetensors').write_bytes(b'weights')
             self.assertTrue(saved_model(run))
 
+    def test_discard_weights_keeps_verified_evaluation_and_resume_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run=fixture(Path(temp))
+            write(run/'config.json',{})
+            write(run/'model_save_complete.json',{'status':'completed'})
+            (run/'model-00001-of-00002.safetensors').write_bytes(b'a'*11)
+            (run/'model-00002-of-00002.safetensors').write_bytes(b'b'*13)
+            write(run/'model.safetensors.index.json',{'weight_map':{
+                'a':'model-00001-of-00002.safetensors','b':'model-00002-of-00002.safetensors'}})
+            expected_removed=24+(run/'model.safetensors.index.json').stat().st_size
+            summary=(run/'evals/TOFU_SUMMARY.json').read_bytes()
+            row={'training_status':'completed','eligible':True,**dict.fromkeys(METRICS,.5)}
+            with patch('representation_batching.pipeline.collect_run',return_value=(row,[],[])):
+                self.assertEqual(inspect_run(run),(True,True))
+                payload=discard_model_weights(run)
+                self.assertEqual(payload['removed_bytes'],expected_removed)
+                self.assertFalse(saved_model(run))
+                self.assertTrue(discarded_model(run))
+                self.assertEqual((run/'evals/TOFU_SUMMARY.json').read_bytes(),summary)
+                self.assertTrue((run/'config.json').exists())
+                self.assertEqual(inspect_run(run),(True,True))
+                self.assertEqual(discard_model_weights(run)['removed_bytes'],expected_removed)
+
     def fake_executor(self,config,seed,fail_evaluation_once=False):
         calls=[]; completed={}; failed=[False]
         def runner(command,log):
@@ -289,6 +319,17 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(all(c[c.index('--seed')+1]=='2' for c in calls if '--seed' in c))
             run_seed(cfg,2,'sig',runner=runner,inspector=inspector,refresher=lambda *_:None)
             self.assertEqual(len(calls),9)
+
+    def test_no_keep_policy_discards_each_arm_only_after_evaluation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg=settings(Path(temp)); cfg['keep_model_weights']=False
+            calls,runner,inspector=self.fake_executor(cfg,2)
+            with patch('representation_batching.pipeline.discard_model_weights',
+                       return_value={'removed_bytes':1024}) as discard:
+                state=run_seed(cfg,2,'sig',runner=runner,inspector=inspector,refresher=lambda *_:None)
+            self.assertEqual(discard.call_count,4)
+            self.assertTrue(all(entry['keep_model_weights'] is False for entry in state['arms'].values()))
+            self.assertTrue(all(entry['weight_cleanup']['removed_bytes']==1024 for entry in state['arms'].values()))
 
     def test_failed_evaluation_resumes_without_retraining(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -413,6 +454,8 @@ class PipelineTests(unittest.TestCase):
             before=fingerprint(cfg,root)
             path.write_text('new controls')
             self.assertEqual(before,fingerprint(cfg,root))
+            cfg['keep_model_weights']=False
+            self.assertEqual(before,fingerprint(cfg,root))
             trainer.write_text('different training')
             self.assertNotEqual(before,fingerprint(cfg,root))
 
@@ -463,6 +506,8 @@ class PipelineTests(unittest.TestCase):
             loaded=load_settings(cfg,root)
             self.assertEqual(loaded['model'],'org/Full')
             self.assertEqual(loaded['dataset'],'org/TOFU')
+            self.assertFalse(loaded['keep_model_weights'])
+            self.assertTrue(load_settings(cfg,root,{'keep_model_weights':True})['keep_model_weights'])
             feature.write_bytes(b'changed')
             with self.assertRaisesRegex(ValueError,'哈希'):
                 load_settings(cfg,root)

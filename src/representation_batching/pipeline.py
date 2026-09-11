@@ -123,6 +123,12 @@ def load_settings(config_path,root=ROOT,overrides=None):
     if isinstance(requested_epochs,bool) or not str(requested_epochs).isascii() or not str(requested_epochs).isdigit() or int(requested_epochs)<=0:
         raise ValueError("num_epochs / --epochs 必须是正整数")
     settings["num_epochs"]=int(requested_epochs)
+    requested_keep_model=(overrides or {}).get("keep_model_weights")
+    if requested_keep_model is None:
+        requested_keep_model=raw.get("keep_model_weights",False)
+    if not isinstance(requested_keep_model,bool):
+        raise ValueError("keep_model_weights 必须是 true 或 false")
+    settings["keep_model_weights"]=requested_keep_model
     # A new epoch budget is a separate experiment, never a continuation of the
     # previous final model or a replacement of its three-epoch manifest.
     if settings["num_epochs"]!=3:
@@ -144,7 +150,7 @@ def load_settings(config_path,root=ROOT,overrides=None):
 
 def fingerprint_payload(settings,root=ROOT,revision=None):
     # Path/config changes cannot silently resume into a different experiment.
-    effective={k:v for k,v in settings.items() if k not in ("scan_roots","report_dir","expected_seeds","training_gpus","evaluation_gpu","main_process_port")}
+    effective={k:v for k,v in settings.items() if k not in ("scan_roots","report_dir","expected_seeds","training_gpus","evaluation_gpu","main_process_port","keep_model_weights")}
     directories=("src/trainer","src/data","src/model","src/evals","src/representation_batching","configs/model","configs/trainer","configs/accelerate","configs/data","configs/eval","configs/collator")
     files=("src/train.py","src/eval.py","configs/unlearn.yaml","configs/eval.yaml",
                  "configs/experiment/unlearn/tofu/representation_npo.yaml","configs/experiment/eval/tofu/default.yaml",
@@ -231,12 +237,65 @@ def saved_model(run):
                for name in ("model.safetensors","pytorch_model.bin"))
 
 
+def discarded_model(run):
+    try:
+        marker=read_json(run/"model_weights_discarded.json")
+        return marker.get("status")=="completed" and not saved_model(run)
+    except (OSError,ValueError,KeyError,TypeError):
+        return False
+
+
+def model_weight_files(run):
+    """Return only final-model weight artifacts at the run root."""
+    run=Path(run)
+    paths=set()
+    for pattern in ("model*.safetensors","pytorch_model*.bin","adapter_model*.safetensors","adapter_model*.bin"):
+        paths.update(path for path in run.glob(pattern) if path.is_file())
+    for name in ("model.safetensors.index.json","pytorch_model.bin.index.json"):
+        index=run/name
+        if not index.is_file():
+            continue
+        paths.add(index)
+        try:
+            for relative in set(read_json(index).get("weight_map",{}).values()):
+                shard=run/relative
+                if shard.parent.resolve()==run.resolve() and shard.is_file():
+                    paths.add(shard)
+        except (OSError,ValueError,KeyError,TypeError):
+            pass
+    return sorted(paths)
+
+
+def discard_model_weights(run):
+    """Delete final weights only after evaluation has been validated."""
+    run=Path(run)
+    files=model_weight_files(run)
+    if not files and discarded_model(run):
+        return read_json(run/"model_weights_discarded.json")
+    if not files:
+        raise ValueError(f"未找到可清理的最终模型权重：{run}")
+    removed=[]
+    total_bytes=0
+    for path in files:
+        size=path.stat().st_size
+        path.unlink()
+        removed.append(path.name)
+        total_bytes+=size
+    if saved_model(run):
+        raise ValueError(f"模型权重清理后仍检测到完整权重：{run}")
+    payload={"status":"completed","removed_files":removed,"removed_bytes":total_bytes,
+             "completed_at":datetime.now(timezone.utc).isoformat()}
+    write_state(run/"model_weights_discarded.json",payload)
+    return payload
+
+
 def inspect_run(run):
     try:
         row,_,_=collect_run(run,[],[],include_evaluation=False)
         marker=run/"model_save_complete.json"
-        trained=(row["training_status"]=="completed" and saved_model(run)
-                 and marker.is_file() and read_json(marker).get("status")=="completed")
+        training_completed=row["training_status"]=="completed"
+        retained=(saved_model(run) and marker.is_file()
+                  and read_json(marker).get("status")=="completed")
     except (OSError,ValueError,KeyError,TypeError):
         return False,False
     # A failed/partially written evaluation must never invalidate saved training.
@@ -245,6 +304,7 @@ def inspect_run(run):
         evaluated=row["eligible"] and all(finite_metric(row.get(m)) for m in METRICS)
     except (OSError,ValueError,KeyError,TypeError):
         evaluated=False
+    trained=training_completed and (retained or (discarded_model(run) and evaluated))
     return trained, trained and evaluated
 
 
@@ -307,7 +367,7 @@ def save_seed_results(seed_root,state):
                 row["evaluation_note"]=collected.get("evaluation_note") or ""
                 # Failed attempts may contain stale/partial metrics. Only publish
                 # metrics from an arm that passed the pipeline's full validation.
-                if row["status"]=="completed" and collected["eligible"]:
+                if row["status"] in ("completed","weight_cleanup_failed") and collected["eligible"]:
                     row.update({m:collected.get(m) for m in METRICS})
             except (OSError,ValueError,KeyError,TypeError) as exc:
                 row["evaluation_status"]="unreadable_or_incomplete"
@@ -324,7 +384,7 @@ def describe_incomplete(run,stage):
         row,_,_=collect_run(run,[],[],include_evaluation=stage=="evaluation")
         details=f"training={row['training_status']}, audit={row['audit']}"
         if stage=="training":
-            details+=f", model_files={saved_model(run)}, save_marker={(run/'model_save_complete.json').exists()}"
+            details+=f", model_files={saved_model(run)}, save_marker={(run/'model_save_complete.json').exists()}, discarded_marker={(run/'model_weights_discarded.json').exists()}"
         else:
             missing=[m for m in METRICS if not finite_metric(row.get(m))]
             details+=f", evaluation={row['evaluation_status']}, missing_metrics={missing}"
@@ -383,6 +443,9 @@ def run_seed(settings,seed,signature,root=ROOT,runner=None,inspector=None,refres
                         while current.exists():
                             attempt+=1; current=seed_root/arm/f"attempt-{attempt:04d}"
                         entry["run_dir"]=str(current); entry["attempts"].append(str(current)); entry["status"]="training"
+                        # Direct programmatic callers from older versions did not
+                        # carry this key; preserve their prior keep behavior.
+                        entry["keep_model_weights"]=settings.get("keep_model_weights",True)
                         write_state(state_path,state)
                         save_seed_results(seed_root,state)
                         print(f"[seed {seed}] [{index}/4] {arm}: 开始训练 → {current}",flush=True)
@@ -408,6 +471,12 @@ def run_seed(settings,seed,signature,root=ROOT,runner=None,inspector=None,refres
                         except (OSError,ValueError,KeyError,TypeError):
                             pass
                     entry["status"]="completed"
+                    if entry.get("keep_model_weights") is False:
+                        stage="weight_cleanup"
+                        cleanup=discard_model_weights(current)
+                        entry["weight_cleanup"]={"status":"completed","removed_bytes":cleanup["removed_bytes"],
+                                                 "marker":str(current/"model_weights_discarded.json")}
+                        print(f"[seed {seed}] {arm}: 评估已核验，删除最终模型权重 {cleanup['removed_bytes']/1024**3:.2f} GiB；评估结果保留",flush=True)
                 except (OSError,ValueError,KeyError,TypeError,subprocess.CalledProcessError) as exc:
                     entry["status"]=stage+"_failed"
                     entry["error"]=f"{type(exc).__name__}: {exc}"
@@ -446,6 +515,11 @@ def build_parser():
     parser.add_argument("--eval-gpu","--evaluation-gpu",dest="evaluation_gpu",help="单张评估 GPU；指定 --gpu 后默认使用该组第一张")
     parser.add_argument("--main-process-port","--port",dest="main_process_port",type=int,help="分布式通信端口；默认 29500 + 较小的训练 GPU 编号")
     parser.add_argument("--epochs",dest="num_epochs",type=int,help="完整训练轮数；同时用于生成清单和训练，覆盖配置中的 num_epochs（默认 3）")
+    model_group=parser.add_mutually_exclusive_group()
+    model_group.add_argument("--keep-model",dest="keep_model_weights",action="store_true",default=None,
+                             help="评估成功后保留最终模型权重；覆盖配置中的 keep_model_weights")
+    model_group.add_argument("--discard-model-after-eval","--no-keep-model","--no-save",dest="keep_model_weights",action="store_false",
+                             help="评估成功并核验结果后删除最终模型权重（默认；run_seed 的 --no-save 语义）")
     parser.add_argument("--dry-run",action="store_true",help="Validate input paths and print commands without launching jobs or writing state")
     return parser
 
@@ -458,10 +532,11 @@ def main():
     args=parser.parse_args()
     if args.seed<0: parser.error("seed 必须是非负整数")
     try:
-        settings=load_settings(args.config,overrides={k:getattr(args,k) for k in ("training_gpus","evaluation_gpu","main_process_port","num_epochs")})
+        settings=load_settings(args.config,overrides={k:getattr(args,k) for k in ("training_gpus","evaluation_gpu","main_process_port","num_epochs","keep_model_weights")})
         print(f"seed={args.seed}; Full={settings['model']}; TOFU={settings['dataset']}",flush=True)
         print(f"epochs={settings['num_epochs']}; 输出目录={settings['output_root']}",flush=True)
         print(f"训练 GPU={settings['training_gpus']}; 评估 GPU={settings['evaluation_gpu']}; port={settings['main_process_port']}",flush=True)
+        print("模型权重策略="+("评估后保留" if settings["keep_model_weights"] else "评估成功后删除"),flush=True)
         if args.dry_run:
             for index,arm in enumerate(ARMS):
                 run=Path(settings["output_root"])/f"seed-{args.seed}"/arm/"attempt-0001"

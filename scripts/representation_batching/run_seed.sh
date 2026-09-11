@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: bash scripts/representation_batching/run_seed.sh 1 [--epochs 10] [--gpu 2,3] [--eval-gpu 2] [--port 29502] [--dry-run] [--config PATH]
+# Usage: bash scripts/representation_batching/run_seed.sh 1 [--epochs 10] [--gpu 2,3] [--no-save|--keep-model] [--dry-run] [--config PATH]
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
