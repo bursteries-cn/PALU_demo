@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -16,6 +17,9 @@ import sys
 UPSTREAM_COMMIT = "4ad738aaf60f6a4385f6e2506d01da99e76c31f3"
 MODEL = "Llama-3.1-8B-Instruct"
 MODEL_ID = f"open-unlearning/tofu_{MODEL}_full"
+# Only these packages may differ in the hardware-compatible environment. Versions
+# are recorded, not assumed compatible: the server still needs a training smoke test.
+HARDWARE_PACKAGES = ("torch", "bitsandbytes", "deepspeed")
 WEIGHT_FILE = re.compile(r"(?:model(?:-\d+-of-\d+)?\.safetensors|pytorch_model(?:-\d+-of-\d+)?\.bin|model\.safetensors\.index\.json|pytorch_model\.bin\.index\.json)")
 
 
@@ -29,13 +33,14 @@ def commands(args):
     common = [
         f"model={MODEL}", f"task_name={task}", "forget_split=forget05",
         "holdout_split=holdout05", f"retain_logs_path={args.retain_logs}",
+        f"model.model_args.attn_implementation={args.attention}",
     ]
     train_args = [
         "--config-name=unlearn.yaml", "experiment=unlearn/tofu/default.yaml",
         "trainer=NPO", *common, "retain_split=retain95",
         f"model.model_args.pretrained_model_name_or_path={MODEL_ID}",
         "trainer.args.per_device_train_batch_size=4",
-        "trainer.args.gradient_accumulation_steps=4",
+        f"trainer.args.gradient_accumulation_steps={8 // len(args.gpu.split(','))}",
         "trainer.args.ddp_find_unused_parameters=true",
         "trainer.args.gradient_checkpointing=true", f"trainer.args.seed={args.seed}",
         f"paths.output_dir={args.output_dir}",
@@ -43,16 +48,19 @@ def commands(args):
     train = [
         args.python, "-m", "accelerate.commands.launch",
         "--config_file", "configs/accelerate/default_config.yaml",
-        "--num_processes", "2", "--main_process_port", str(args.port),
+        "--num_processes", str(len(args.gpu.split(','))), "--main_process_port", str(args.port),
         "src/train.py", *train_args,
     ]
     evaluate = [
         args.python, "src/eval.py", "experiment=eval/tofu/default.yaml", *common,
         f"model.model_args.pretrained_model_name_or_path={args.output_dir}",
         f"paths.output_dir={args.output_dir / 'evals'}", "eval.tofu.overwrite=true",
+        f"seed={args.seed}",
     ]
     resolve = [args.python, "src/train.py", *train_args, "--cfg", "job", "--resolve"]
-    return {"resolve_config": resolve, "train": train, "evaluate": evaluate}
+    return {"resolve_config": resolve,
+            "resolve_eval_config": [*evaluate, "--cfg", "job", "--resolve"],
+            "train": train, "evaluate": evaluate}
 
 
 def check_upstream(root):
@@ -61,11 +69,12 @@ def check_upstream(root):
         raise ValueError(f"Upstream HEAD must be {UPSTREAM_COMMIT}; got {commit}")
     dirty = subprocess.check_output(
         ["git", "status", "--porcelain", "--untracked-files=all", "--",
-         "src", "configs", "scripts", "requirements.txt"], cwd=root, text=True,
+         "src", "configs", "scripts", "requirements.txt", "setup.py"], cwd=root, text=True,
     ).strip()
     if dirty:
         raise ValueError("Upstream training/evaluation sources must be clean:\n" + dirty)
-    for relative in ["src/train.py", "src/eval.py", "configs/accelerate/default_config.yaml"]:
+    for relative in ["src/train.py", "src/eval.py", "configs/accelerate/default_config.yaml",
+                     "configs/accelerate/zero_stage3_offload_config.json", "requirements.txt", "setup.py"]:
         if not (root / relative).is_file():
             raise ValueError(f"Upstream checkout is incomplete: {relative}")
 
@@ -75,8 +84,14 @@ def check_environment(args):
     code = """
 import importlib.metadata as m, json, pathlib, sys
 from packaging.specifiers import SpecifierSet
-versions, errors = {}, []
-for line in pathlib.Path('requirements.txt').read_text().splitlines():
+if sys.version_info < (3, 11):
+    raise SystemExit('The pinned upstream setup.py requires Python >=3.11; use a separate compatible environment.')
+policy, attention, gpu_count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+allowed = set(sys.argv[4:]) if policy == 'hardware-compatible' else set()
+versions, errors, differences = {}, [], {}
+# The pinned setup.py also requires lm-eval for the unconditional evaluator import.
+requirements = pathlib.Path('requirements.txt').read_text().splitlines() + ['lm-eval==0.4.11']
+for line in requirements:
     line = line.split('#', 1)[0].strip()
     if '==' not in line:
         continue
@@ -86,19 +101,36 @@ for line in pathlib.Path('requirements.txt').read_text().splitlines():
     except m.PackageNotFoundError:
         actual = None
     versions[name] = actual
-    if actual is None or not SpecifierSet('==' + expected).contains(actual, prereleases=True):
+    if actual is None:
         errors.append(f'{name}: installed={actual}, required={expected}')
+    elif not SpecifierSet('==' + expected).contains(actual, prereleases=True):
+        differences[name] = {'upstream': expected, 'installed': actual}
+        if name not in allowed:
+            errors.append(f'{name}: installed={actual}, required={expected}')
 if errors:
-    raise SystemExit('Use a separate upstream environment:\\n' + '\\n'.join(errors))
-import torch, flash_attn
-versions['flash-attn'] = m.version('flash-attn')
-if torch.cuda.device_count() != 2:
-    raise SystemExit('Exactly two visible CUDA GPUs are required for this baseline.')
-print(json.dumps({'python': sys.version, 'packages': versions,
-                  'gpus': [torch.cuda.get_device_name(i) for i in range(2)]}))
+    raise SystemExit('Selected environment does not match the declared policy:\\n' + '\\n'.join(errors))
+import torch
+if attention == 'flash_attention_2':
+    import flash_attn
+    versions['flash-attn'] = m.version('flash-attn')
+if torch.cuda.device_count() != gpu_count:
+    raise SystemExit(f'Exactly {gpu_count} visible CUDA GPUs are required.')
+devices = [{'name': torch.cuda.get_device_name(i),
+            'capability': list(torch.cuda.get_device_capability(i))} for i in range(gpu_count)]
+if any(d['capability'][0] >= 10 for d in devices):
+    cuda = tuple(int(v) for v in (torch.version.cuda or '0.0').split('.')[:2])
+    if cuda < (12, 8):
+        raise SystemExit('Blackwell requires a compatible PyTorch CUDA build; do not downgrade to upstream torch 2.4.1.')
+print(json.dumps({'python': sys.version, 'executable': sys.executable,
+                  'packages': versions, 'differences_from_upstream': differences,
+                  'installed_packages': dict(sorted((d.metadata['Name'], d.version) for d in m.distributions())),
+                  'torch_cuda': torch.version.cuda, 'torch_arch_list': torch.cuda.get_arch_list(),
+                  'gpus': devices}))
 """
     return json.loads(subprocess.check_output(
-        [args.python, "-c", code], cwd=args.upstream_dir, env=train_env(args), text=True,
+        [args.python, "-c", code, args.environment, args.attention,
+         str(len(args.gpu.split(','))), *HARDWARE_PACKAGES],
+        cwd=args.upstream_dir, env=train_env(args), text=True,
     ))
 
 
@@ -107,6 +139,9 @@ def train_env(args):
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
     # Prevent a caller's local PALU PYTHONPATH from shadowing the official modules.
     env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PATH"] = str(Path(args.python).parent) + os.pathsep + env.get("PATH", "")
     return env
 
 
@@ -160,6 +195,13 @@ def execute(args):
     if not isinstance(retain.get("forget_truth_ratio"), dict):
         raise ValueError("Retain log lacks forget_truth_ratio; do not pass TOFU_SUMMARY.json")
     environment = check_environment(args)
+    if args.check_only:
+        print(json.dumps(environment, ensure_ascii=False, indent=2))
+        # Import and compose the real upstream entry points without loading a model.
+        for phase in ("resolve_config", "resolve_eval_config"):
+            subprocess.run(plan[phase], cwd=args.upstream_dir, env=train_env(args), check=True)
+        print("Preflight passed: source, environment, visible GPUs and Hydra configuration. No training was run.")
+        return
     args.output_dir.mkdir(parents=True, exist_ok=False)
     audit_dir = args.output_dir / "baseline_audit"
     audit_dir.mkdir()
@@ -167,11 +209,16 @@ def execute(args):
         "upstream_commit": UPSTREAM_COMMIT, "upstream_dir": str(args.upstream_dir),
         "model_id": MODEL_ID, "seed": args.seed, "commands": plan,
         "gpu_ids": args.gpu, "environment": environment,
+        "environment_policy": args.environment, "attention": args.attention,
+        "batch": {"world_size": len(args.gpu.split(',')), "per_device_train_batch_size": 4,
+                  "gradient_accumulation_steps": 8 // len(args.gpu.split(',')), "effective_batch_size": 32},
+        "upstream_launch": {"world_size": 2, "per_device_train_batch_size": 4,
+                            "gradient_accumulation_steps": 4, "attention": "flash_attention_2"},
         "retain_logs_path": str(args.retain_logs),
         "retain_logs_sha256": hashlib.sha256(args.retain_logs.read_bytes()).hexdigest(),
         "launcher_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "keep_model_weights": args.keep_model,
-        "scope": "Unmodified upstream full run. Per-component first-step audit is a separate follow-up.",
+        "scope": "Pinned upstream sources with declared launch/environment overrides. GPU compatibility and numerical reproduction are not established by preflight.",
     }
     write_json(audit_dir / "run_contract.json", contract)
     state = {"status": "resolving_config", "upstream_commit": UPSTREAM_COMMIT}
@@ -179,6 +226,7 @@ def execute(args):
     try:
         write_json(state_path, state)
         run_command(plan["resolve_config"], args, audit_dir / "resolved_config.yaml")
+        run_command(plan["resolve_eval_config"], args, audit_dir / "resolved_eval_config.yaml")
         state["status"] = "training"
         write_json(state_path, state)
         run_command(plan["train"], args, audit_dir / "train.log")
@@ -210,19 +258,32 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True, help="Exact new result directory")
     parser.add_argument("--retain-logs", type=Path, required=True, help="Matching Retain95 TOFU_EVAL.json")
     parser.add_argument("--python", default=sys.executable, help="Python from a separate upstream environment")
-    parser.add_argument("--gpu", default="0,1", help="Two distinct GPU IDs; first is used for evaluation")
+    parser.add_argument("--gpu", default="0,1,2,3", help="Two or four distinct GPU IDs; first is used for evaluation")
+    parser.add_argument("--attention", choices=("sdpa", "flash_attention_2"), default="sdpa")
+    parser.add_argument("--environment", choices=("hardware-compatible", "official"),
+                        default="hardware-compatible", help="Hardware mode records torch/bitsandbytes/deepspeed deviations; other upstream pins still apply")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--port", type=int, default=29501)
     parser.add_argument("--keep-model", action="store_true", help="Keep final weights after successful evaluation")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing anything")
+    parser.add_argument("--check-only", action="store_true", help="Check source, dependencies, GPUs and upstream config imports; do not train or save outputs")
     args = parser.parse_args(argv)
     gpu_ids = args.gpu.split(",")
-    if len(gpu_ids) != 2 or len(set(gpu_ids)) != 2 or not all(s.isdigit() for s in gpu_ids):
-        parser.error("--gpu requires two distinct numeric IDs, e.g. 0,1")
+    if len(gpu_ids) not in (2, 4) or not all(s.isdigit() for s in gpu_ids) or len(set(map(int, gpu_ids))) != len(gpu_ids):
+        parser.error("--gpu requires two or four distinct numeric IDs, e.g. 0,1,2,3")
+    args.gpu = ",".join(str(int(s)) for s in gpu_ids)
+    if args.dry_run and args.check_only:
+        parser.error("Use either --dry-run or --check-only")
     if args.seed < 0 or not 1 <= args.port <= 65535:
         parser.error("--seed must be nonnegative; --port must be in 1..65535")
     for name in ("upstream_dir", "output_dir", "retain_logs"):
         setattr(args, name, getattr(args, name).expanduser().resolve())
+    # Keep the venv's bin/python path: resolving its symlink would select the
+    # base interpreter and lose the environment. Anchor relative paths before chdir.
+    if os.sep in args.python or args.python.startswith("~"):
+        args.python = str(Path(args.python).expanduser().absolute())
+    else:
+        args.python = shutil.which(args.python) or args.python
     return args
 
 
