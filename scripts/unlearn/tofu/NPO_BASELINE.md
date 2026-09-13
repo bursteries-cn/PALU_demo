@@ -22,7 +22,7 @@ bash scripts/unlearn/tofu/train_tofu_npo_llama3.sh --dry-run
 bash scripts/unlearn/tofu/train_tofu_npo_llama3.sh
 ```
 
-默认参数为 GPU `0,1,2,3`，**4 卡 × 每卡 batch 4 × 梯度累积 2 = 32**，seed=0，lr=1e-5，10 epochs，1 epoch warmup、linear scheduler、paged_adamw_32bit、weight decay=0.01、beta=0.1、alpha=gamma=1。`max_grad_norm=0` 显式关闭本次训练的裁剪；可用 `--max-grad-norm 1` 开启。该参数通过现有 DeepSpeed 的 `gradient_clipping: auto` 生效，不改其他实验的配置。
+默认参数为 GPU `0,1,2,3`，**4 卡 × 每卡 batch 4 × 梯度累积 2 = 32**，seed=0，lr=1e-5，10 epochs，1 epoch warmup、linear scheduler、paged_adamw_32bit、weight decay=0.01、beta=0.1、alpha=gamma=1、`max_grad_norm=1`（与官方 HF 默认一致）。可用 `--max-grad-norm 0` 关闭裁剪。该参数通过现有 DeepSpeed 的 `gradient_clipping: auto` 生效，不改其他实验的配置。
 
 默认沿用原服务器路径：
 
