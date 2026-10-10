@@ -45,6 +45,7 @@ class PALU(GradDiff):
         first_n=-1,
         target_mode="mean",
         non_sensitive_constraint_type="kl",
+        detach_mean_target=False,
         *args,
         **kwargs,
     ):
@@ -54,6 +55,9 @@ class PALU(GradDiff):
 
         self.target_mode = target_mode
         self.non_sensitive_constraint_type = non_sensitive_constraint_type
+        if not isinstance(detach_mean_target, bool):
+            raise ValueError("detach_mean_target must be a boolean")
+        self.detach_mean_target = detach_mean_target
 
         if self.ref_model is None:
             self.ref_model = self._prepare_ref_model(self.model)
@@ -141,6 +145,10 @@ class PALU(GradDiff):
 
         if self.target_mode == "mean":
             averageLogits = logits_flat.mean(dim=-1, keepdim=True).expand(-1, k)
+            # Keep the official full-mean gradient by default. The ablation
+            # changes only the backward path, not the forward target value.
+            if self.detach_mean_target:
+                averageLogits = averageLogits.detach()
             target_logits = averageLogits
         else:
             raise ValueError(
