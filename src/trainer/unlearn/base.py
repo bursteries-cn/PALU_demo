@@ -43,15 +43,13 @@ class UnlearnTrainer(FinetuneTrainer):
                 ):
                     # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache @ step 0: expected module 1, but got module 0`
                     # This is expected and is not an error, see: https://github.com/microsoft/DeepSpeed/discussions/4081
-                    config_kwargs.update(
+                    config_kwargs["zero_optimization"].update(
                         {
-                            "zero_optimization.reduce_bucket_size": hidden_size
+                            "reduce_bucket_size": hidden_size
                             * hidden_size,
-                            "zero_optimization.stage3_param_persistence_threshold": 10
+                            "stage3_param_persistence_threshold": 10
                             * hidden_size,
-                            "zero_optimization.stage3_prefetch_bucket_size": 0.9
-                            * hidden_size
-                            * hidden_size,
+                            "stage3_prefetch_bucket_size": int(0.9 * hidden_size * hidden_size),
                         }
                     )
 

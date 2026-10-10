@@ -41,13 +41,15 @@ python scripts/palu_mean_ablation/probe_gradients.py \
 
 沿用 `requirements.txt` 的依赖版本，特别是 `torch==2.4.1`、`transformers==4.45.1` 和 `accelerate==0.34.2`。正式实验需要 CUDA、可加载的原始 TOFU 模型、TOFU 评估数据及配套 Retain 模型的 `TOFU_EVAL.json`。不能用 `TOFU_SUMMARY.json` 替代样本级参考结果。
 
-默认设置沿用 Llama-3.1 demo：forget05/holdout05/retain95、K=5000、每个敏感跨度 first_n=3、lr=2e-5、alpha=0.2、gamma=1、batch=8、累积=4、10 epochs、SDPA、梯度检查点。两组都使用 NLL 保留项与原有普通位置约束。默认 seed 为 42、43、44。
+默认设置：forget05/holdout05/retain95、K=5000、每个敏感跨度 first_n=3、lr=2e-5、alpha=0.2、gamma=1、10 epochs、SDPA、梯度检查点。默认使用 GPU 0,1,2,3，每卡 batch=1、累积=8，有效 batch=32；独立评估使用第一张卡，batch=1。两组都使用 NLL 保留项与原有普通位置约束。默认 seed 为 42、43、44。
+
+默认不保留最终权重。独立评估仍需要临时 checkpoint：每对实验组均训练、评估成功并通过配对校验后，删除两组权重和权重索引，保留配置、tokenizer、训练状态、日志和全部指标。失败或未完成的一对保留权重供排错。要保留权重，显式添加 `--keep-model`。`--skip-eval` 的训练检查也会在配对校验后清理权重。
 
 先生成计划，检查模型和参考路径：
 
 ```bash
 python scripts/palu_mean_ablation/run_comparison.py \
-  --gpu 0 --seeds 42 43 44 \
+  --gpu 0,1,2,3 --seeds 42 43 44 \
   --model-path /absolute/path/to/tofu_full_model \
   --retain-logs /absolute/path/to/retain95/TOFU_EVAL.json \
   --output artifacts/palu_mean_ablation/plan \
@@ -58,7 +60,7 @@ python scripts/palu_mean_ablation/run_comparison.py \
 
 ```bash
 python scripts/palu_mean_ablation/run_comparison.py \
-  --gpu 0 --seeds 42 43 44 \
+  --gpu 0,1,2,3 --seeds 42 43 44 \
   --model-path /absolute/path/to/tofu_full_model \
   --retain-logs /absolute/path/to/retain95/TOFU_EVAL.json \
   --output artifacts/palu_mean_ablation/tofu_forget05
@@ -72,7 +74,11 @@ python scripts/palu_mean_ablation/run_comparison.py \
 --override trainer.args.optim=adamw_torch
 ```
 
-需要比较固定优化步数时，用 `--max-steps 100`。单 GPU 显存不足时，同时降低两组的 `--batch-size` 并增加 `--grad-accum`，保留相同有效 batch。脚本按单进程运行，避免仓库在多进程训练时跳过自定义评估。每个实验组都会保留最终模型；默认三组 seed 共保存六个模型，需预留磁盘空间。
+多卡使用仓库的 Accelerate + DeepSpeed ZeRO-3 配置，分片训练模型、参考模型和优化器状态，需要 `deepspeed==0.15.4`。只运行一次这个驱动程序，它负责启动各卡进程；两组依次执行，不在同一组显卡上同时训练。可用 `--main-process-port 29514` 避免与其他分布式任务的端口冲突。单卡用 `--gpu 0`，双卡用 `--gpu 0,1`。
+
+未指定 `--grad-accum` 时，脚本自动选择累积步数，使 `GPU 数 × 每卡 batch × 累积步数 = 32`；无法整除会要求显式指定。可通过 `--batch-size` 和 `--grad-accum` 改变预算，但两组必须共享相同设置。需要比较固定优化步数时，用 `--max-steps 100`。
+
+评估另起单卡进程，因此不受仓库多进程训练跳过自定义评估的限制。临时磁盘空间仍需容纳一对最终权重；8B bf16 权重两份约 32 GB，不含初始模型缓存和其他输出。ZeRO-3 保存完整权重还涉及聚合与写盘，参考模型初始化在分片前也有临时显存开销；多卡并不保证任意显存配置均能运行。
 
 ## 输出与实验有效性
 
@@ -82,8 +88,8 @@ python scripts/palu_mean_ablation/run_comparison.py \
 
 - `manifest.json`：精确命令、共同设置、代码与可见本地输入文件的 SHA-256。
 - `gradient_probe.json`：真实遗忘损失的梯度验证。
-- `seed_<seed>/<variant>/resolved_config.json`、`trainer_state.json`、训练日志和最终模型。
-- `telemetry.json`：实际依赖版本、GPU 名称、CUDA 分配/保留显存峰值和训练入口耗时。
+- `seed_<seed>/<variant>/resolved_config.json`、`trainer_state.json`、训练日志和权重清理记录 `result.json`；默认成功完成后不保留最终模型。
+- `telemetry.json`：实际依赖版本、各 GPU 名称、CUDA 分配/保留显存峰值和训练入口耗时；多卡同时保留 `telemetry.rank<N>.json`，避免进程互相覆盖。
 - `evals/TOFU_EVAL.json`、`TOFU_SUMMARY.json`、评估来源记录。
 - `comparison.json`、`comparison.csv`、`comparison.md`：逐组结果、逐 seed 配对差值及配对差值的均值/样本标准差。
 
@@ -91,7 +97,7 @@ python scripts/palu_mean_ablation/run_comparison.py \
 
 全部差值均为 **stop_mean − full_mean**：FQ/MU/流畅度通常越高越好，KS statistic/EM 通常越低越好。FQ 是 KS 检验 p-value，不是“遗忘百分比”；同时看 KS statistic、EM、MU 与流畅度，避免只凭一个饱和的 p-value 下结论。
 
-`train_runtime` 和每优化步秒数来自 Trainer，训练阶段关闭了评估。`entrypoint_wall_seconds` 另包含模型/数据初始化和最终保存。GPU 显存记录是整个训练入口的 PyTorch allocator 峰值，包括模型与参考模型加载，按字节记录；不等同于 GPU 总占用，第三方 CUDA 分配也可能不在其中。CPU 运行没有 GPU 显存数值。默认报告比较相同预算后的结果，不直接测量达到某一 FQ/MU 门槛的时间。
+`train_runtime` 和每优化步秒数来自 Trainer，训练阶段关闭了评估。`entrypoint_wall_seconds` 另包含模型/数据初始化和最终保存，多卡取各进程耗时最大值。GPU 显存记录是整个训练入口的 PyTorch allocator 峰值，包括模型与参考模型加载，按字节记录；多卡汇总取各卡峰值最大值，同时保留每卡明细。它不等同于 GPU 总占用或各卡占用之和，第三方 CUDA 分配也可能不在其中。CPU 运行没有 GPU 显存数值。默认报告比较相同预算后的结果，不直接测量达到某一 FQ/MU 门槛的时间。
 
 `detach()` 只改变反向传播路径；全词表均值前向、完整 LM 输出层和常规矩阵反向仍然存在。不能把尾部输出梯度归零等同于整个模型的稀疏计算，也不能把这项消融预先认定为改进。
 
@@ -108,8 +114,8 @@ python scripts/palu_mean_ablation/run_comparison.py \
 python -m unittest discover -s tests/palu_mean_ablation -v
 ```
 
-测试覆盖解析梯度、128256 维词表、全词表选择时的等价性、尾部梯度恰好为零的例外、冻结参考模型选择、跨度前缀/EOS/mask、无敏感位置、同初始权重的两组微型 Llama 训练、真实 Hydra 训练/评估配置、配对汇总与无效评估拒绝。
+测试覆盖解析梯度、128256 维词表、全词表选择时的等价性、尾部梯度恰好为零的例外、冻结参考模型选择、跨度前缀/EOS/mask、无敏感位置、同初始权重的两组微型 Llama 训练、真实 Hydra 训练/评估配置、配对汇总与无效评估拒绝，以及多卡启动计划、分卡遥测、ZeRO-3 参考模型配置和权重清理。
 
-`--skip-eval` 仅用于训练流程或性能检查，报告明确标注没有测量遗忘效果。2026-10-10 本地验证使用 CPU、微型 Llama、合成 tokenizer、仓库 forget05 标注和本地小型 retain 数据，各组通过真实训练入口执行 2 步并保存模型。正式 7B/8B TOFU 遗忘效果与 CUDA 性能尚需在 GPU 环境运行。
+`--skip-eval` 仅用于训练流程或性能检查，报告明确标注没有测量遗忘效果。2026-10-10 本地验证使用 CPU、微型 Llama、合成 tokenizer、仓库 forget05 标注和本地小型 retain 数据，各组通过真实训练入口执行 2 步。正式 7B/8B TOFU 遗忘效果、真实多 GPU 执行与 CUDA 性能尚需在 GPU 环境运行。
 
 本次测试数量、梯度结果和真实入口验证记录见 [VALIDATION.md](VALIDATION.md)。

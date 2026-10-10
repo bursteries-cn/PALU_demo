@@ -21,7 +21,8 @@ def settings():
         model_revision=None, forget_split="forget05", holdout_split="holdout05", retain_split="retain95",
         lr=2e-5, batch_size=8, grad_accum=4, epochs=10., max_steps=-1, max_grad_norm=1.,
         alpha=.2, top_k=5000, first_n=3, override=[], retain_logs=Path("/tmp/reference logs.json"),
-        eval_batch_size=8, eval_dataset=None, classifier_model=None, skip_eval=False)
+        eval_batch_size=8, eval_dataset=None, classifier_model=None, skip_eval=False,
+        num_processes=1, main_process_port=29513)
 
 
 def compose_training(args, run, variant):
@@ -96,7 +97,8 @@ class ComparisonProtocolTests(unittest.TestCase):
         write_json(run / "evals/TOFU_SUMMARY.json", {"forget_quality": fq, "model_utility": .6,
             "exact_memorization": .5, "forget_Q_A_gibberish": .8})
         write_json(run / "evals/TOFU_EVAL.json", {"forget_truth_ratio": {"value_by_index": {"0": {"score": .2}, "1": {"score": .5}}}})
-        write_json(run / "evals/evaluation_provenance.json", {"status": "completed", "reference_sha256": hash_file(reference)})
+        write_json(run / "evals/evaluation_provenance.json", {"status": "completed", "reference_sha256": hash_file(reference),
+            "config": {"model": {"model_args": {"pretrained_model_name_or_path": str(run)}}}})
         metrics = collect_metrics(run, reference, True)
         write_json(run / "result.json", {"status": "completed", "metrics": metrics})
         return run, reference
@@ -128,7 +130,8 @@ class ComparisonProtocolTests(unittest.TestCase):
             write_json(run / "evals/evaluation_provenance.json", {"status": "completed_unverified_cache"})
             with self.assertRaisesRegex(ValueError, "provenance"):
                 collect_metrics(run, reference, True)
-            write_json(run / "evals/evaluation_provenance.json", {"status": "completed", "reference_sha256": hash_file(reference)})
+            write_json(run / "evals/evaluation_provenance.json", {"status": "completed", "reference_sha256": hash_file(reference),
+                "config": {"model": {"model_args": {"pretrained_model_name_or_path": str(run)}}}})
             write_json(run / "evals/TOFU_SUMMARY.json", {"forget_quality": .4})
             with self.assertRaisesRegex(ValueError, "Missing/non-finite"):
                 collect_metrics(run, reference, True)

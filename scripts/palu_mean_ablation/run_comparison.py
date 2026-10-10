@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shlex
 import statistics
 import subprocess
@@ -18,6 +19,9 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 VARIANTS = {"full_mean": False, "stop_mean": True}
+WEIGHT_FILE = re.compile(r"(?:model(?:-\d+-of-\d+)?\.safetensors(?:\.index\.json)?|"
+                         r"pytorch_model(?:-\d+-of-\d+)?\.bin(?:\.index\.json)?|"
+                         r"adapter_model\.(?:bin|safetensors))")
 QUALITY_METRICS = ("forget_quality", "forget_ks_statistic", "model_utility",
                    "exact_memorization", "forget_Q_A_gibberish")
 PERFORMANCE_METRICS = ("train_runtime", "train_steps_per_second", "seconds_per_optimizer_step",
@@ -47,7 +51,7 @@ def hash_file(path):
 
 def input_snapshot(args):
     files = []
-    for folder, pattern in (("src", "*.py"), ("configs", "*.yaml"),
+    for folder, pattern in (("src", "*.py"), ("configs", "*.yaml"), ("configs", "*.json"),
                             ("scripts/palu_mean_ablation", "*.py")):
         files.extend((ROOT / folder).rglob(pattern))
     files.extend((ROOT / "data/palu/TOFU" / f"{args.forget_split}_with_common_words_gpt").rglob("*"))
@@ -74,7 +78,9 @@ def validate_overrides(overrides):
                  "trainer.args.data_seed", "trainer.args.eval_strategy", "trainer.args.eval_on_start",
                  "trainer.args.do_eval", "trainer.args.do_train", "trainer.args.report_to",
                  "trainer.args.save_strategy", "do_save", "eval", "model",
-                 "forget_split", "holdout_split", "retain_split")
+                 "forget_split", "holdout_split", "retain_split", "trainer.args.deepspeed",
+                 "model.model_args.device_map", "trainer.args.per_device_train_batch_size",
+                 "trainer.args.gradient_accumulation_steps")
     for override in overrides:
         key = override.partition("=")[0].lstrip("+~")
         if key in protected or any(item.startswith(key + ".") for item in protected) or key.startswith("eval."):
@@ -104,6 +110,11 @@ def build_commands(args, run, seed, variant):
     if args.model_revision:
         train.extend([assignment("+model.model_args.revision", args.model_revision),
                       assignment("+model.tokenizer_args.revision", args.model_revision)])
+    if args.num_processes > 1:
+        train = [args.python, "-m", "accelerate.commands.launch", "--config_file",
+                 str(ROOT / "configs/accelerate/default_config.yaml"),
+                 "--num_processes", str(args.num_processes),
+                 "--main_process_port", str(args.main_process_port), "--mixed_precision", "bf16", *train[1:]]
     evaluate = [args.python, str(ROOT / "src/eval.py"), "experiment=eval/tofu/default", f"model={args.model}",
                 assignment("model.model_args.pretrained_model_name_or_path", str(run)),
                 assignment("model.tokenizer_args.pretrained_model_name_or_path", str(run)),
@@ -118,6 +129,44 @@ def build_commands(args, run, seed, variant):
             evaluate.append(assignment(f"eval.tofu.metrics.forget_Q_A_gibberish.{key}.pretrained_model_name_or_path",
                                        args.classifier_model))
     return train, None if args.skip_eval else evaluate
+
+
+def merge_telemetry(run, num_processes):
+    """Aggregate after all workers exit; memory is the maximum per-rank peak."""
+    if num_processes == 1:
+        records = [read_json(run / "telemetry.json")]
+    else:
+        records = [read_json(run / f"telemetry.rank{rank}.json") for rank in range(num_processes)]
+    for rank, record in enumerate(records):
+        if record.get("status") != "completed" or record.get("rank") != rank or record.get("world_size") != num_processes:
+            raise ValueError(f"Missing/failed/misconfigured telemetry for rank {rank}")
+        for key in ("packages", "cuda_available", "cuda_version", "cuda_visible_devices"):
+            if record.get(key) != records[0].get(key):
+                raise ValueError(f"Distributed runtime differs on rank {rank}: {key}")
+    merged = dict(records[0])
+    for key in ("entrypoint_wall_seconds", "cuda_peak_allocated_bytes", "cuda_peak_reserved_bytes"):
+        values = [record.get(key) for record in records]
+        merged[key] = max(values) if all(value is not None for value in values) else None
+    merged["gpu_names_by_rank"] = [record.get("gpu_name") for record in records]
+    merged["memory_scope"] = "maximum per-rank PyTorch allocator peak; not summed GPU memory"
+    merged["ranks"] = records
+    write_json(run / "telemetry.json", merged)
+    return merged
+
+
+def cleanup_completed_weights(run, keep_model):
+    """Only clean this run's regular weight files after its metrics are verified."""
+    result = read_json(run / "result.json")
+    if result.get("status") != "completed" or not result.get("metrics"):
+        raise ValueError("Incomplete experiment; weights preserved")
+    files = [] if keep_model else sorted(path for path in run.iterdir() if WEIGHT_FILE.fullmatch(path.name))
+    if any(path.is_symlink() or not path.is_file() for path in files):
+        raise ValueError("Refusing to remove non-regular model artifacts")
+    for path in files:
+        path.unlink()
+    result.update(keep_model_weights=keep_model, removed_weight_files=[path.name for path in files])
+    write_json(run / "result.json", result)
+    return result
 
 
 def normalized_config(config):
@@ -154,6 +203,8 @@ def collect_metrics(run, retain_logs, evaluate):
     last = next((item for item in reversed(state["log_history"]) if "train_runtime" in item), {})
     if not last or state["global_step"] <= 0:
         raise ValueError("Training did not record optimizer steps and runtime")
+    if state.get("max_steps", state["global_step"]) != state["global_step"]:
+        raise ValueError("Training did not reach its planned optimizer-step count; weights preserved")
     telemetry = read_json(run / "telemetry.json")
     metrics = {key: last.get(key) for key in ("train_runtime", "train_steps_per_second")}
     metrics.update({key: telemetry.get(key) for key in PERFORMANCE_METRICS if key not in metrics})
@@ -164,11 +215,14 @@ def collect_metrics(run, retain_logs, evaluate):
         provenance = read_json(run / "evals/evaluation_provenance.json")
         if provenance["status"] != "completed" or provenance.get("reference_sha256") != hash_file(retain_logs):
             raise ValueError("Evaluation provenance or Retain reference is invalid")
+        evaluated_model = provenance.get("config", {}).get("model", {}).get("model_args", {}).get("pretrained_model_name_or_path")
+        if not evaluated_model or Path(evaluated_model).resolve() != run.resolve():
+            raise ValueError("Evaluation did not use this run's checkpoint; weights preserved")
         summary = read_json(run / "evals/TOFU_SUMMARY.json")
         for key in QUALITY_METRICS:
             if key != "forget_ks_statistic":
                 value = summary.get(key)
-                if not isinstance(value, (int, float)) or not math.isfinite(value):
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                     raise ValueError(f"Missing/non-finite evaluation metric: {key}")
                 metrics[key] = value
         logs = read_json(run / "evals/TOFU_EVAL.json")
@@ -203,7 +257,8 @@ def summarize(output):
         if pair["full_mean"]["optimizer_steps"] != pair["stop_mean"]["optimizer_steps"]:
             raise ValueError(f"Optimizer step counts differ for seed {seed}")
         telemetry = {name: read_json(output / f"seed_{seed}" / name / "telemetry.json") for name in VARIANTS}
-        for key in ("packages", "cuda_available", "cuda_version", "gpu_name", "cuda_visible_devices"):
+        for key in ("packages", "cuda_available", "cuda_version", "gpu_name", "cuda_visible_devices",
+                    "world_size", "gpu_names_by_rank"):
             if telemetry["full_mean"].get(key) != telemetry["stop_mean"].get(key):
                 raise ValueError(f"Runtime environment differs for seed {seed}: {key}")
         delta = {"seed": seed}
@@ -230,6 +285,7 @@ def summarize(output):
              f"Completed pairs: {len(paired)} / {len(manifest['seeds'])}", "",
              "Differences below are stop_mean minus full_mean. FQ is a KS p-value; it is not an erasure percentage.",
              "Training runtime excludes evaluation; entrypoint wall time also includes setup and final save.", "",
+             "GPU memory metrics are the maximum per-rank allocator peak; evaluation uses one GPU.", "",
              "| Metric | Mean paired difference | Paired sample stddev | n |", "|---|---:|---:|---:|"]
     for key, values in aggregate.items():
         std = values["stddev_paired_difference"]
@@ -253,7 +309,9 @@ def parse_args():
     parser.add_argument("--summarize", type=Path, help="Rebuild reports without running any training")
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts/palu_mean_ablation" / datetime.now().strftime("%Y%m%d_%H%M%S"))
     parser.add_argument("--python", default=sys.executable)
-    parser.add_argument("--gpu", default="0", help="One GPU; each arm runs in a fresh single-process job")
+    parser.add_argument("--gpu", default="0,1,2,3", help="Visible GPU IDs; multi-GPU training uses ZeRO-3, evaluation uses the first GPU")
+    parser.add_argument("--main-process-port", type=int, default=29513)
+    parser.add_argument("--keep-model", action="store_true", help="Retain final weights; default deletes them after successful evaluation")
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
     parser.add_argument("--model", choices=["Llama-3.1-8B-Instruct", "Llama-2-7b-chat-hf", "Llama-2-7b-hf"], default="Llama-3.1-8B-Instruct")
     parser.add_argument("--model-path", help="Same initial checkpoint for every arm")
@@ -266,12 +324,12 @@ def parse_args():
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--top-k", type=int, default=5000)
     parser.add_argument("--first-n", type=int, default=3)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--grad-accum", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=1, help="Per-device training batch size")
+    parser.add_argument("--grad-accum", type=int, help="Default chooses global effective batch 32")
     parser.add_argument("--epochs", type=float, default=10)
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--max-grad-norm", type=float, default=1.)
-    parser.add_argument("--eval-batch-size", type=int, default=8)
+    parser.add_argument("--eval-batch-size", type=int, default=1)
     parser.add_argument("--eval-dataset", help="Optional local TOFU evaluation dataset")
     parser.add_argument("--classifier-model", help="Optional local fluency classifier")
     parser.add_argument("--override", action="append", default=[], help="Shared Hydra override for both arms")
@@ -280,8 +338,23 @@ def parse_args():
     args = parser.parse_args()
     if args.summarize:
         return args
-    if "," in args.gpu or int(os.getenv("WORLD_SIZE", "1")) != 1:
-        parser.error("Use a single GPU/process for comparable timings and repository TOFU evaluation")
+    gpu_ids = [value.strip() for value in args.gpu.split(",")]
+    if any(not value.isdecimal() for value in gpu_ids) or len(gpu_ids) != len(set(gpu_ids)):
+        parser.error("--gpu must contain unique non-negative GPU IDs, e.g. 0,1,2,3")
+    if int(os.getenv("WORLD_SIZE", "1")) != 1:
+        parser.error("Launch this driver once with python; it launches distributed workers itself")
+    args.gpu = ",".join(gpu_ids)
+    args.num_processes = len(gpu_ids)
+    if not 1 <= args.main_process_port <= 65535:
+        parser.error("--main-process-port must be between 1 and 65535")
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args.grad_accum is None:
+        micro_batch = args.batch_size * args.num_processes
+        if 32 % micro_batch:
+            parser.error("GPU count x batch size must divide 32, or set --grad-accum explicitly")
+        args.grad_accum = 32 // micro_batch
+    args.effective_batch_size = args.num_processes * args.batch_size * args.grad_accum
     if len(args.seeds) != len(set(args.seeds)):
         parser.error("Seeds must be unique")
     if min(args.batch_size, args.grad_accum, args.top_k, args.eval_batch_size, args.epochs, args.lr) <= 0:
@@ -315,6 +388,7 @@ def main():
         return
     args.output.mkdir(parents=True, exist_ok=False)
     manifest = {"seeds": args.seeds, "evaluation_enabled": not args.skip_eval,
+                "train_cuda_visible_devices": args.gpu, "eval_cuda_visible_devices": args.gpu.split(",")[0],
                 "settings": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
                 "code_and_data_sha256": input_snapshot(args), "runs": []}
     for index, seed in enumerate(args.seeds):
@@ -327,12 +401,23 @@ def main():
     write_json(args.output / "manifest.json", manifest)
     if args.dry_run:
         print(f"Plan: {args.output / 'manifest.json'}")
+        print(f"Training GPUs: {args.gpu}; evaluation GPU: {args.gpu.split(',')[0]}; "
+              f"effective batch: {args.num_processes} x {args.batch_size} x {args.grad_accum} = {args.effective_batch_size}; "
+              f"keep weights: {args.keep_model}")
         for run in manifest["runs"]:
-            print(shlex.join(run["train_argv"]))
+            print(shlex.join(["env", f"CUDA_VISIBLE_DEVICES={args.gpu}", *run["train_argv"]]))
             if run["eval_argv"]:
-                print(shlex.join(run["eval_argv"]))
+                print(shlex.join(["env", f"CUDA_VISIBLE_DEVICES={args.gpu.split(',')[0]}", *run["eval_argv"]]))
         return
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": args.gpu, "WANDB_MODE": "disabled", "TOKENIZERS_PARALLELISM": "false"}
+    eval_env = {**env, "CUDA_VISIBLE_DEVICES": args.gpu.split(",")[0]}
+    if args.num_processes > 1:
+        preflight = [args.python, "-c", "import importlib.metadata, torch; "
+                     f"assert torch.cuda.is_available() and torch.cuda.device_count() == {args.num_processes}, "
+                     "'Requested GPUs are not all available'; print('DeepSpeed:', importlib.metadata.version('deepspeed'))"]
+        code, _ = execute(preflight, args.output / "environment_check.log", env)
+        if code:
+            raise RuntimeError(f"Multi-GPU environment check failed; see {args.output / 'environment_check.log'}")
     probe = [args.python, str(ROOT / "scripts/palu_mean_ablation/probe_gradients.py"),
              "--output", str(args.output / "gradient_probe.json")]
     code, _ = execute(probe, args.output / "gradient_probe.log", env)
@@ -352,9 +437,10 @@ def main():
             write_json(run / "result.json", result)
             if code:
                 raise RuntimeError(f"Training failed; see {run / 'train.log'}")
+            merge_telemetry(run, args.num_processes)
             if planned["eval_argv"]:
                 print(f"Evaluating seed={planned['seed']} variant={planned['variant']}", flush=True)
-                code, elapsed = execute(planned["eval_argv"], run / "eval.log", env)
+                code, elapsed = execute(planned["eval_argv"], run / "eval.log", eval_env)
                 result.update(eval_exit_code=code, eval_wall_seconds=elapsed)
                 if code:
                     result["status"] = "eval_failed"
@@ -365,6 +451,13 @@ def main():
             result["metrics"] = collect_metrics(run, args.retain_logs, planned["eval_argv"] is not None)
             result["status"] = "completed"
             write_json(run / "result.json", result)
+            # Verify any completed pair before discarding either arm's weights.
+            pair_runs = [args.output / f"seed_{planned['seed']}" / name for name in VARIANTS]
+            if all((path / "result.json").is_file() and read_json(path / "result.json").get("status") == "completed"
+                   for path in pair_runs):
+                summarize(args.output)
+                for path in pair_runs:
+                    cleanup_completed_weights(path, args.keep_model)
     finally:
         summarize(args.output)
     print(f"Comparison: {args.output / 'comparison.md'}")

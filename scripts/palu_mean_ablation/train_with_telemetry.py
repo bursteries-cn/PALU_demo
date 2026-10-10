@@ -22,6 +22,12 @@ def main():
     sys.path.insert(0, str(ROOT / "src"))
     sys.argv = [str(ROOT / "src/train.py"), *overrides]
     cuda = torch.cuda.is_available()
+    rank = int(os.getenv("RANK", "0"))
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    # Select the rank's device before measuring memory or loading either model.
+    if cuda:
+        torch.cuda.set_device(local_rank)
     telemetry = {
         "status": "started",
         "packages": {name: importlib.metadata.version(name)
@@ -29,6 +35,9 @@ def main():
         "cuda_available": cuda,
         "cuda_version": torch.version.cuda,
         "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
+        "rank": rank,
+        "local_rank": local_rank,
+        "world_size": world_size,
         "timing_scope": "training entry point including setup and final save; evaluation disabled",
     }
     if cuda:
@@ -49,8 +58,11 @@ def main():
             telemetry["cuda_peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
             telemetry["cuda_peak_reserved_bytes"] = torch.cuda.max_memory_reserved()
         telemetry["entrypoint_wall_seconds"] = time.perf_counter() - started
-        args.telemetry.parent.mkdir(parents=True, exist_ok=True)
-        args.telemetry.write_text(json.dumps(telemetry, indent=2) + "\n", encoding="utf-8")
+        output = args.telemetry
+        if world_size > 1:
+            output = output.with_name(f"{output.stem}.rank{rank}{output.suffix}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(telemetry, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
