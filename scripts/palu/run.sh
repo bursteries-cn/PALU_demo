@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Edit this parameter block, then: bash scripts/palu_mean_ablation/run.sh
+# Edit this parameter block, then: bash scripts/palu/run.sh
 # Environment assignments override these defaults, e.g. LR=1e-5 SEEDS="0 1 2" bash .../run.sh
 set -euo pipefail
 PALU_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -18,7 +18,7 @@ RETAIN_LOGS="${RETAIN_LOGS:-${PALU_ROOT}/saves/eval/tofu_${MODEL}_${RETAIN_SPLIT
 DATASET_PATH="${DATASET_PATH:-/mnt/sda/cr/LLM_unlearning/datset/TOFU}"
 CLASSIFIER_MODEL="${CLASSIFIER_MODEL:-${PALU_ROOT}/models/gibberish-detector}"
 
-# Shared training parameters for full_mean and stop_mean.
+# PALU training parameters, shared across seeds.
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
 SEEDS="${SEEDS:-0 1 2}"
 LR="${LR:-2e-5}"
@@ -33,9 +33,9 @@ GRAD_ACCUM="${GRAD_ACCUM:-}" # Empty: choose effective batch 32 from GPU count.
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29513}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
-KEEP_MODEL="${KEEP_MODEL:-0}" # 0: remove final weights after successful paired evaluation.
+KEEP_MODEL="${KEEP_MODEL:-0}" # 0: remove final weights after successful evaluation of each seed.
 
-# Diagnostics: fixed samples shared across arms/seeds; h[first answer - 1] before lm_head.
+# Diagnostics: fixed samples shared across seeds; h[first answer - 1] before lm_head.
 DIAGNOSTICS="${DIAGNOSTICS:-1}"
 LOSS_HISTORY="${LOSS_HISTORY:-1}"
 PROBE_EVERY="${PROBE_EVERY:-5}"
@@ -43,13 +43,13 @@ PROBE_FORGET_SAMPLES="${PROBE_FORGET_SAMPLES:-32}" # Positive integer or all.
 PROBE_RETAIN_SAMPLES="${PROBE_RETAIN_SAMPLES:-32}"
 PROBE_SEED="${PROBE_SEED:-20261011}"
 PROBE_TEMPERATURE="${PROBE_TEMPERATURE:-1.0}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PALU_ROOT}/artifacts/palu_mean_ablation/${FORGET_SPLIT}_$(TZ=Asia/Shanghai date +%Y%m%d_%H%M%S)_$$}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PALU_ROOT}/artifacts/palu/${FORGET_SPLIT}_$(TZ=Asia/Shanghai date +%Y%m%d_%H%M%S)_$$}"
 for FLAG in "$KEEP_MODEL" "$LOSS_HISTORY" "$DIAGNOSTICS"; do
   case "$FLAG" in 0|1) ;; *) printf 'KEEP_MODEL, LOSS_HISTORY and DIAGNOSTICS must be 0 or 1\n' >&2; exit 2 ;; esac
 done
 
 read -r -a SEED_ARRAY <<< "$SEEDS"
-COMMAND=("$PYTHON_BIN" "$PALU_ROOT/scripts/palu_mean_ablation/run_comparison.py"
+COMMAND=("$PYTHON_BIN" "$PALU_ROOT/scripts/palu/run_experiment.py"
   --output "$OUTPUT_DIR" --gpu "$GPU_IDS" --seeds "${SEED_ARRAY[@]}"
   --model "$MODEL" --model-path "$MODEL_PATH" --retain-logs "$RETAIN_LOGS"
   --forget-split "$FORGET_SPLIT" --retain-split "$RETAIN_SPLIT" --holdout-split "$HOLDOUT_SPLIT"

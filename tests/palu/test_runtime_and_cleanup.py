@@ -10,17 +10,17 @@ from unittest.mock import patch
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "scripts/palu_mean_ablation"))
+sys.path.insert(0, str(ROOT / "scripts/palu"))
 sys.path.insert(0, str(ROOT / "src"))
-from run_comparison import cleanup_completed_weights, merge_telemetry, read_json, write_json
-import test_comparison_protocol as protocol
+from run_experiment import cleanup_completed_weights, merge_telemetry, read_json, write_json
+import test_experiment_protocol as protocol
 
 
 class RuntimeAndCleanupTests(unittest.TestCase):
     def test_multi_gpu_plan_preserves_batch_and_uses_single_gpu_evaluation(self):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "plan"
-            result = subprocess.run([sys.executable, str(ROOT / "scripts/palu_mean_ablation/run_comparison.py"),
+            result = subprocess.run([sys.executable, str(ROOT / "scripts/palu/run_experiment.py"),
                 "--dry-run", "--output", str(output), "--gpu", "1,3,4,5", "--seeds", "42"],
                 cwd=ROOT, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -36,17 +36,17 @@ class RuntimeAndCleanupTests(unittest.TestCase):
             self.assertIn("CUDA_VISIBLE_DEVICES=1 ", result.stdout)
             args = protocol.settings()
             args.num_processes, args.batch_size, args.grad_accum = 4, 1, 8
-            full = protocol.compose_training(args, Path(temp) / "full", "full_mean")
-            stop = protocol.compose_training(args, Path(temp) / "stop", "stop_mean")
-            from run_comparison import validate_pair
-            validate_pair(full, stop)
-            self.assertEqual(full["trainer"]["args"]["gradient_accumulation_steps"], 8)
+            config = protocol.compose_training(args, Path(temp) / "seed_42")
+            from run_experiment import validate_config
+            validate_config(config, 42)
+            self.assertEqual(config["trainer"]["args"]["gradient_accumulation_steps"], 8)
+            self.assertEqual(len(manifest["runs"]), 1)
 
     def test_invalid_gpu_topology_and_ambiguous_default_batch_are_rejected(self):
         for flags in (["--gpu", "0,0"], ["--gpu", "0,"], ["--gpu", "0,1,2"],
                       ["--gpu", "0", "--main-process-port", "0"]):
             with self.subTest(flags=flags):
-                result = subprocess.run([sys.executable, str(ROOT / "scripts/palu_mean_ablation/run_comparison.py"),
+                result = subprocess.run([sys.executable, str(ROOT / "scripts/palu/run_experiment.py"),
                     "--dry-run", *flags], cwd=ROOT, capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
 
@@ -108,11 +108,11 @@ class RuntimeAndCleanupTests(unittest.TestCase):
 
     def test_evaluation_of_another_checkpoint_is_rejected_before_cleanup(self):
         with tempfile.TemporaryDirectory() as temp:
-            run, reference = protocol.ComparisonProtocolTests().fixture(Path(temp), "full_mean", 20., .4)
+            run, reference = protocol.ExperimentProtocolTests().fixture(Path(temp), 42, 20., .4)
             provenance = read_json(run / "evals/evaluation_provenance.json")
             provenance["config"]["model"]["model_args"]["pretrained_model_name_or_path"] = "/other/checkpoint"
             write_json(run / "evals/evaluation_provenance.json", provenance)
-            from run_comparison import collect_metrics
+            from run_experiment import collect_metrics
             with self.assertRaisesRegex(ValueError, "this run's checkpoint"):
                 collect_metrics(run, reference, True)
 

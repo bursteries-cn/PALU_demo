@@ -1,0 +1,42 @@
+# PALU 单组诊断基线验证
+
+日期：2026-10-12。代码从原实验分支 `cca8424` 拆出，移除梯度切断与双组调度，保留官方均值梯度、训练记录和固定样本诊断。
+
+## 本地回归测试
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m unittest discover -s tests/palu -v
+```
+
+32 项测试通过，包括：
+
+- 真实 PALU 损失的完整均值梯度公式、128256 维词表、冻结参考 top-K、敏感片段前缀/EOS/mask、无敏感位置及微型模型参数更新。
+- 实际 Hydra 配置、每 seed 单次启动、跨 seed 配置/步数/运行环境校验、FQ 参考与评估模型来源校验。
+- 多卡命令与有效 batch、单卡独立评估、逐 rank 遥测、ZeRO-3 参考配置、成功清理权重以及失败/符号链接保护。
+- 首答案预测位置、最终归一化后的表征捕获、KL 方向、参考缓存校验、RNG/模式恢复。含 dropout、随机 Retain 配对和梯度累计时，开启/关闭诊断的最终参数逐位相同。
+- 四条曲线的 PNG/PDF、95% Student-t 区间、单 seed 无虚构区间、缺失步不插值、中文/空格路径以及 bash 启动参数。
+
+测试日志：本机 `/private/tmp/palu-baseline-tests-20261012.log`。
+
+## 真实入口 CPU 冒烟运行
+
+通过新的 `run_experiment.py`、独立参考预计算进程和实际 `src/train.py`，运行 seed 0/1/2，各 3 个优化步，梯度累计 2。每个 seed 只生成一个训练目录。开启四条损失记录和 Retain 表征诊断，探针为 4 个 Forget 与 2 个 Retain 样本，记录 step 0/2/3。
+
+结果目录：仓库的 `artifacts/palu/local_validation_20261012/`，由 gitignore 排除。
+
+- `summary.json` 状态为 completed，包含 3 个 seed 的绝对值汇总。
+- 三个 seed 的最终 `model.safetensors` 均按默认设置删除，结果、配置及诊断历史保留。
+- 生成单面板四条训练损失图，以及上下两个面板的固定损失/表征 KL 图；PNG/PDF 已生成并检查。30 条曲线统计记录均为 n=3。
+- 此次参考采用同一初始微型 checkpoint，以验证 step 0 KL=0；没有训练真实 Retain95，也没有执行 TOFU 质量评估。这是工程流程验证，不能用于比较遗忘效果或 GPU 性能。
+
+## 双进程诊断验证
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python tests/palu/check_distributed_diagnostics.py
+```
+
+本机使用真实双 CPU rank / Gloo，训练 2 步并在 step 0/1/2 诊断。通过参数一致性、主进程单份历史、3 个 Forget / 2 个 Retain 的不均匀填充排除检查。输出 `/private/tmp/palu-baseline-gloo-20261012`。
+
+本轮环境为 macOS CPU，PyTorch 2.4.1、Transformers 4.45.1；未执行 CUDA/DeepSpeed ZeRO-3 的实际训练。服务器多 GPU 数值表现与资源开销仍以服务器运行结果为准。
+
+原双组消融的验证记录与用户服务器实验由原分支和独立 memory 笔记保留，不作为本次代码重构的新增实验结果。

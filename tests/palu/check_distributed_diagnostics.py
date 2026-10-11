@@ -13,7 +13,7 @@ import torch.multiprocessing as mp
 from transformers import TrainingArguments
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT / "src"), str(ROOT / "scripts/palu_mean_ablation"), str(Path(__file__).parent)]
+sys.path[:0] = [str(ROOT / "src"), str(ROOT / "scripts/palu"), str(Path(__file__).parent)]
 from test_diagnostics import fixture, cache_fixture
 from trainer.unlearn.palu import PALU
 

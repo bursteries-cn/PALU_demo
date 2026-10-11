@@ -14,7 +14,7 @@ from tokenizers.models import WordLevel
 from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast, TrainingArguments
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT / "src"), str(ROOT / "scripts/palu_mean_ablation")]
+sys.path[:0] = [str(ROOT / "src"), str(ROOT / "scripts/palu")]
 from data.collators import DataCollatorForSupervisedDataset
 from data.unlearn import ForgetRetainDataset
 from trainer.unlearn.palu import PALU
@@ -22,8 +22,8 @@ from trainer.palu_diagnostics import (answer_prediction_positions, capture_pre_h
     representation_distances, sha256_file, tokenizer_fingerprint)
 from prepare_diagnostics import fixed_samples
 from plot_history import LOSSES, aggregate, mean_interval, read_history, render
-from run_comparison import build_commands, write_json
-from test_comparison_protocol import settings, compose_training
+from run_experiment import build_commands, write_json
+from test_experiment_protocol import settings, compose_training
 
 
 def fixture():
@@ -162,29 +162,28 @@ class PlotTests(unittest.TestCase):
         self.assertAlmostEqual(interval["ci95_half_width"], 2.4841377, places=6)
         self.assertIsNone(mean_interval([1.])["ci95_half_width"])
 
-    def test_missing_steps_use_only_matched_seed_observations(self):
-        histories = {variant: {0: {1: {"loss_total": 1.}, 2: {"loss_total": 2.}},
-                              1: {1: {"loss_total": 3.}}} for variant in ("full_mean", "stop_mean")}
-        del histories["stop_mean"][1][1]
+    def test_missing_steps_use_only_observed_seeds_without_interpolation(self):
+        histories = {0: {1: {"loss_total": 1.}, 2: {"loss_total": 2.}},
+                     1: {1: {"loss_total": 3.}}}
         rows = aggregate(histories, [0, 1], "training", LOSSES[:1])
-        self.assertTrue(all(row["n"] == 1 and row["ci95_half_width"] is None for row in rows))
-        self.assertTrue(all(not row["all_seeds_present"] for row in rows))
+        self.assertEqual((rows[0]["mean"], rows[0]["n"], rows[0]["all_seeds_present"]), (2., 2, True))
+        self.assertEqual((rows[1]["mean"], rows[1]["n"], rows[1]["all_seeds_present"]), (2., 1, False))
+        self.assertIsNone(rows[1]["ci95_half_width"])
 
     def test_four_curves_export_png_pdf_and_statistics(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             runs = []
             for seed in (0, 1, 2):
-                for variant in ("full_mean", "stop_mean"):
-                    run = root / f"seed_{seed}" / variant
-                    run.mkdir(parents=True)
-                    runs.append({"seed": seed, "variant": variant, "output_dir": str(run)})
-                    rows = [{"step": step, "loss_total": 2 + seed * .1,
-                        "loss_forget": 1 + seed * .1, "loss_retain_nll": .7, "loss_common_kl": .3,
-                        "forget_repr_kl": .5 + seed * .1, "retain_repr_kl": .2} for step in (1, 2)]
-                    text = "".join(json.dumps(row) + "\n" for row in rows)
-                    (run / "loss_history.jsonl").write_text(text)
-                    (run / "probe_history.jsonl").write_text(text)
+                run = root / f"seed_{seed}"
+                run.mkdir(parents=True)
+                runs.append({"seed": seed, "output_dir": str(run)})
+                rows = [{"step": step, "loss_total": 2 + seed * .1,
+                    "loss_forget": 1 + seed * .1, "loss_retain_nll": .7, "loss_common_kl": .3,
+                    "forget_repr_kl": .5 + seed * .1, "retain_repr_kl": .2} for step in (1, 2)]
+                text = "".join(json.dumps(row) + "\n" for row in rows)
+                (run / "loss_history.jsonl").write_text(text)
+                (run / "probe_history.jsonl").write_text(text)
             write_json(root / "manifest.json", {"seeds": [0, 1, 2], "runs": runs})
             output = render(root)
             for name in ("loss_curves.png", "loss_curves.pdf", "loss_vs_retain_kl.png", "loss_vs_retain_kl.pdf", "curve_statistics.csv"):
@@ -198,7 +197,7 @@ class LauncherTests(unittest.TestCase):
             output = Path(temporary) / "中文 plan with spaces"
             env = {**os.environ, "PYTHON_BIN": sys.executable, "OUTPUT_DIR": str(output),
                    "DATASET_PATH": "/tmp/data with spaces", "RETAIN_MODEL_PATH": "/tmp/retain with spaces"}
-            process = subprocess.run(["bash", str(ROOT / "scripts/palu_mean_ablation/run.sh"), "--dry-run"],
+            process = subprocess.run(["bash", str(ROOT / "scripts/palu/run.sh"), "--dry-run"],
                 cwd=ROOT, env=env, capture_output=True, text=True)
             self.assertEqual(process.returncode, 0, process.stderr)
             manifest = json.loads((output / "manifest.json").read_text())
@@ -209,10 +208,11 @@ class LauncherTests(unittest.TestCase):
             args.output, args.retain_model_path = output, "/tmp/retain with spaces"
             args.probe_every, args.probe_temperature = 5, 1.
             args.probe_cache_sha256 = "a" * 64
-            full = compose_training(args, Path("/tmp/full"), "full_mean")
-            self.assertEqual(full["trainer"]["method_args"]["diagnostics"]["cache_sha256"], "a" * 64)
-            self.assertEqual(full["trainer"]["method_args"]["diagnostics"]["cache_path"], str(output / "reference_cache.pt"))
-            self.assertTrue(full["trainer"]["method_args"]["track_loss_components"])
+            config = compose_training(args, Path("/tmp/seed_42"))
+            self.assertEqual(config["trainer"]["method_args"]["diagnostics"]["cache_sha256"], "a" * 64)
+            self.assertEqual(config["trainer"]["method_args"]["diagnostics"]["cache_path"], str(output / "reference_cache.pt"))
+            self.assertTrue(config["trainer"]["method_args"]["track_loss_components"])
+            self.assertEqual(len(manifest["runs"]), 3)
 
 
 if __name__ == "__main__":

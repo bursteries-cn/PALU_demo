@@ -66,8 +66,8 @@ We directly use the **Original Model** and **Retain Model** provided by **Open-U
 
 ## 🧪 Unlearning
 
-The paired full-mean versus detached-mean PALU experiment is documented in
-[PALU mean-gradient ablation](scripts/palu_mean_ablation/README.md).
+The multi-GPU PALU launcher, loss curves, and Retain-reference diagnostics are documented in
+[PALU experiments](scripts/palu/README.md).
 
 Directly perform PALU, starting from the original models provided by Open-Unlearning.
 

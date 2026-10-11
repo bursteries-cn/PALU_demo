@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cache Retain-only pre-head representations before launching either training arm."""
+"""Cache Retain-only pre-head representations once before launching training seeds."""
 import argparse
 import json
 from pathlib import Path

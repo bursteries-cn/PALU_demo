@@ -7,4 +7,3 @@ method_args:
   first_n: -1
   target_mode: "mean"
   non_sensitive_constraint_type: "kl"
-  detach_mean_target: false
