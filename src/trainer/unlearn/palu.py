@@ -46,6 +46,8 @@ class PALU(GradDiff):
         target_mode="mean",
         non_sensitive_constraint_type="kl",
         detach_mean_target=False,
+        track_loss_components=False,
+        diagnostics=None,
         *args,
         **kwargs,
     ):
@@ -61,6 +63,11 @@ class PALU(GradDiff):
 
         if self.ref_model is None:
             self.ref_model = self._prepare_ref_model(self.model)
+        self._palu_monitor = None
+        if track_loss_components or diagnostics:
+            from trainer.palu_diagnostics import PaluMonitor
+            self._palu_monitor = PaluMonitor(self, diagnostics)
+            self.add_callback(self._palu_monitor)
 
     def compute_loss(self, model, inputs, return_outputs=False):
         forget_inputs = inputs["forget"]
@@ -69,6 +76,8 @@ class PALU(GradDiff):
             "input_ids": forget_inputs["input_ids"],
             "attention_mask": forget_inputs["attention_mask"],
         }
+        if getattr(self, "_palu_diagnostic_mode", False):
+            forget_inputs["use_cache"] = False
 
         forget_outputs = model(**forget_inputs)
         logits = forget_outputs.logits  # [B, T, V]
@@ -201,6 +210,8 @@ class PALU(GradDiff):
             "attention_mask": retain_inputs["attention_mask"],
             "labels": retain_inputs["labels"],
         }
+        if getattr(self, "_palu_diagnostic_mode", False):
+            retain_inputs["use_cache"] = False
         retain_loss = self.compute_retain_loss(model=model, retain_inputs=retain_inputs)
 
         loss = (
@@ -208,4 +219,11 @@ class PALU(GradDiff):
             + self.alpha * retain_loss
             + self.alpha * non_sensitive_constraint_loss
         )
+        monitor = getattr(self, "_palu_monitor", None)
+        if monitor is not None:
+            self._last_palu_terms = torch.stack((loss, self.gamma * sensitive_forget_loss,
+                self.alpha * retain_loss, self.alpha * non_sensitive_constraint_loss,
+                sensitive_forget_loss, retain_loss, non_sensitive_constraint_loss)).detach()
+            if model.training and not getattr(self, "_palu_diagnostic_mode", False):
+                monitor.record(self._last_palu_terms)
         return (loss, forget_outputs) if return_outputs else loss

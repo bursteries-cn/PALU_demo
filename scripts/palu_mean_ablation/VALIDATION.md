@@ -57,3 +57,21 @@
 以上多卡检查属于配置及模拟接口测试。本机没有 CUDA，未实际启动 DeepSpeed 多 GPU 训练，不能据此确认服务器的显存、通信或实际训练速度。
 
 正式实验的运行方式与指标解释见 [README](README.md)。
+
+# 2026-10-11 启动、四条损失曲线及表征诊断验证
+
+实现集中参数的 Bash 启动、实时子进程日志、每 optimizer step 的四项损失记录、固定训练样本的 Retain-only 参考表征缓存与周期测量，以及跨 seed 的逐点 95% t 区间端帽误差棒。默认参考位置是最终 RMSNorm 后、LM head 前的 h[a-1]，方向为 KL(softmax(h_R/T) ∥ softmax(h_U/T))；未把它加入训练目标。
+
+在上述同一 CPU 依赖环境，消融目录 33 项自动测试通过，其中新增 10 项验证答案首 token（含 -200 标签和 padding）、KL 方向/维度求和、pre-head 提取、随机数/模块模式恢复、缓存篡改拒绝、梯度累积记录、真实 Hydra/Bash 启动（含空格和中文路径）、t 区间和单 seed 缺失区间、四曲线 PNG/PDF 输出。
+
+微型 Llama 开启 attention dropout，训练随机抽取 Retain 样本并累积两个 microbatch；有/无周期诊断的最终参数逐张量完全一致。诊断间隔为 2、训练 3 步，确认 step 0/2/3 测量，最终测量在 Trainer 汇总 runtime 之前进行，参考模型没有梯度。
+
+通过真实驱动、参考预计算进程和训练入口，运行 seed 0/1/2 × full_mean/stop_mean，各 3 步；保存四条损失、逐样本 KL/余弦、固定样本诊断损失、曲线统计及 PNG/PDF。两组每个图点均有 n=3 的统计，正常结束后的六份最终模型权重全部清理。输出为仓库 `artifacts/palu_mean_ablation/local_validation_diagnostics_20261011_v2/`，由 gitignore 排除。此次参考使用同一初始微型 checkpoint，以检查 step 0 KL=0；没有训练真正的 Retain95 参考，没有 TOFU 质量评估，图只用于验证记录与可视化流程。
+
+另运行真实双进程 CPU/Gloo 检查：3 条 Forget、2 条 Retain 探针，在 2 个进程间等长补齐；每次统计仍为 3/2、重复补齐样本不计入，只有主进程历史，两个进程最终参数完全相同。原始临时输出 `/private/tmp/palu-diagnostics-gloo-20261011_v2/`。可复核同一检查：
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python tests/palu_mean_ablation/check_distributed_diagnostics.py
+```
+
+本机无 CUDA，双 CPU 进程不验证 ZeRO-3 参数分片、服务器显存或真实 8B 多 GPU 性能；使用 README 的 2 步命令在服务器检查。增加诊断后的 runtime 包含额外前向和汇总开销，不能与诊断关闭的旧性能结果直接混作梯度方案效率差异。

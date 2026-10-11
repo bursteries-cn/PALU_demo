@@ -11,6 +11,74 @@
 
 两组的均值仍随当前模型变化。在相同 logits 上，前向损失完全相同；参数更新后，两组的模型、均值和损失可以逐渐分化。`stop_mean` 不是固定参考模型均值，也不是 top-K 均值。
 
+## 一键启动与集中设置参数
+
+在服务器项目目录激活 PALU 环境后：
+
+```bash
+bash scripts/palu_mean_ablation/run.sh
+```
+
+参数集中在 `run.sh` 开头，默认四卡、seed 0/1/2、学习率 2e-5、alpha=0.2、gamma=1、top_k=5000、first_n=3、10 epoch。修改文件中的默认值即可；环境变量也可以临时覆盖：
+
+```bash
+LR=1e-5 ALPHA=0.3 bash scripts/palu_mean_ablation/run.sh
+```
+
+默认开启损失记录及 Retain-only 表征诊断；不保留成功完成的最终模型权重。脚本复用同一个配对驱动，两组共享全部参数。终端实时显示子进程日志，完整内容仍写入各组 `train.log`。
+
+需要检查的路径是 `MODEL_PATH`、`RETAIN_MODEL_PATH`、`RETAIN_LOGS`、`DATASET_PATH`、`CLASSIFIER_MODEL`。默认 Retain 权重是公开的 `open-unlearning/tofu_Llama-3.1-8B-Instruct_retain95`，也可改成已下载的本地模型目录。`RETAIN_LOGS` 是原有 FQ 参考 JSON，两者需对应同一个参考 checkpoint 和 split；评估 JSON 无法代替模型权重。服务器数据路径默认保留实际拼写 `/mnt/sda/cr/LLM_unlearning/datset/TOFU`。
+
+不加载模型的启动检查，以及多卡短跑：
+
+```bash
+bash scripts/palu_mean_ablation/run.sh --dry-run
+SEEDS="0" MAX_STEPS=2 PROBE_EVERY=1 bash scripts/palu_mean_ablation/run.sh --skip-eval
+```
+
+短跑只有一个 seed，不能估计跨 seed 置信区间，也不测量遗忘质量。正式图默认来自三个 seed。运行中的代码和启动脚本纳入 manifest 哈希，实验过程中不要编辑它们；环境变量覆盖可用于下一次实验。
+
+## 四条训练损失与 T 型误差棒
+
+`loss_curves.png/pdf` 含两个面板，分别显示 full_mean、stop_mean，每个面板四条折线：
+
+| 曲线 | 记录字段 | 定义 |
+|---|---|---|
+| Total | `loss_total` | 下列三项之和 |
+| Forget | `loss_forget` | gamma × 敏感 token 遗忘损失 |
+| Retain NLL | `loss_retain_nll` | alpha × Retain 数据答案 NLL |
+| Common-token KL | `loss_common_kl` | alpha × Forget 数据普通答案 token 的 KL(current ∥ 初始 Full) |
+
+训练损失每个 optimizer step 写入 `loss_history.jsonl/csv`；先平均实际梯度累积窗口内各 microbatch 的原始目标，再汇总各 GPU，不改变原训练目标或梯度。原始未加权的三项也保存在日志中。损失值发生在本次更新前；横轴编号是它对应的更新编号。
+
+同一个 step 汇总两个实验组都已有记录的相同 seed，绘制均值及逐点 95% Student-t 置信区间：`mean ± t(0.975, n-1) × sample_std / sqrt(n)`，每个可估计的点均有带端帽的 T 型误差棒。图和 `plots/curve_statistics.csv` 记录实际 n 与使用的 seed。不会插值缺失 step，也不会把 microbatch 当成独立 seed。n=1 时只画点和折线，不伪造置信区间。n=3 的区间可能很宽；它描述随机种子的变异，采用 t 区间的通常假设，不是整条曲线的同时置信带。
+
+## Retain-only 最后表征 KL
+
+新增诊断参考是只用 Retain 数据训练的 checkpoint，与 PALU 原损失的冻结 Full 参考分开。默认固定抽取 32 条 Forget、32 条 Retain 训练样本，在 step 0、每 5 个 optimizer step、最终更新后测量；样本及顺序跨两个实验组和所有 seed 共享。调整 `PROBE_EVERY`、`PROBE_FORGET_SAMPLES`、`PROBE_RETAIN_SAMPLES`；样本数可以设置为 `all`。默认只表示固定训练子集，不表示全训练集。
+
+若答案首 token 的输入位置为 a，提取最后一层 Transformer 经最终 RMSNorm 后、进入 `lm_head` 前的 `h[a-1]`，即预测首 token 的状态。定位包含 PALU 的 -200 普通答案标签，不能用第一个敏感标签代替答案首 token；无有效答案、缺少前驱、截断等样本会跳过并记录原因。使用与训练相同的 token IDs、attention mask 和模板。参考预计算直接调用 Llama decoder，当前模型通过真实包装后的 LM 前向与 pre-head hook 提取，避免绕过 ZeRO-3。
+
+对隐藏维度作 softmax：`q_R=softmax(h_R/T)`、`q_U=softmax(h_U/T)`，记录 `KL(q_R ∥ q_U)`，隐藏维度求和、有效样本求平均，FP32 计算、自然对数单位 nats，默认固定 T=1。它是表征坐标归一化后的诊断，不是词表概率 KL；随温度、尺度和坐标系变化，不能单独证明删除。额外记录余弦距离辅助核对。当前支持同架构、同词表的 Llama；参考 checkpoint 还应具有相同预训练来源。
+
+启动前另开进程加载 Retain-only 模型，预计算后退出；训练期间仅保留小型 CPU 参考缓存，无第三个常驻大模型。`reference_cache.pt/json` 保存样本、位置、参考版本/本地权重哈希和数据配置；两组每次训练前验证缓存 SHA-256，Trainer 再核对选定样本与 Tokenizer。缺少 checkpoint 或不兼容的缓存会明确报错，不会退回 Full 参考。
+
+在同一诊断时刻，以 eval/no_grad 在固定样本重新计算四项损失与表征 KL，保存 `probe_history.jsonl/csv` 和逐样本 `probe_samples.jsonl/csv`。固定样本损失是逐样本目标的平均，和实际训练的 microbatch 平均分别标记。`loss_vs_retain_kl.png/pdf` 上排四条固定样本损失，下排 Forget/Retain 两条表征 KL，共享 step 横轴，误差棒仍来自跨 seed 的同一口径。`plots/trend_intervals.csv` 保存相邻测量区间的变化量和 loss 下降/KL 上升的候选区间；不把它当显著性检验或精确变点。间隔为 5 时只能定位到区间。KL 接近 Retain 模型不保证 FQ 增大。
+
+诊断保存并恢复随机数状态及模型模式，不更新参数、优化器或 scheduler。所有 GPU 参与相同次数的前向，重复补齐样本的统计权重为零，只有主进程写日志。新增诊断会增加耗时；完整训练入口耗时包含它，参考预计算作为共享阶段另记在 manifest；`diagnostic_timing.json` 记录各次诊断的最大每卡耗时，并区分任何晚于 Trainer runtime 统计的异常终止补测。不建议用简单相减推断纯训练速度。性能实验可用：
+
+```bash
+DIAGNOSTICS=0 LOSS_HISTORY=0 bash scripts/palu_mean_ablation/run.sh
+```
+
+每完成一个 seed 的配对实验，自动重建 PNG/PDF 和曲线统计；实验过程中或结束后也可手动重画：
+
+```bash
+python scripts/palu_mean_ablation/plot_history.py artifacts/palu_mean_ablation/<本次输出目录>
+```
+
+旧实验只保存总损失时无法补出历史分项或 KL，需重新运行。
+
 ## 先验证梯度事实
 
 在仓库根目录、项目 Python 环境中运行：

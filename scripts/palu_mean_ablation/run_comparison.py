@@ -25,7 +25,8 @@ WEIGHT_FILE = re.compile(r"(?:model(?:-\d+-of-\d+)?\.safetensors(?:\.index\.json
 QUALITY_METRICS = ("forget_quality", "forget_ks_statistic", "model_utility",
                    "exact_memorization", "forget_Q_A_gibberish")
 PERFORMANCE_METRICS = ("train_runtime", "train_steps_per_second", "seconds_per_optimizer_step",
-                       "entrypoint_wall_seconds", "cuda_peak_allocated_bytes", "cuda_peak_reserved_bytes")
+                       "entrypoint_wall_seconds", "cuda_peak_allocated_bytes", "cuda_peak_reserved_bytes",
+                       "diagnostic_wall_seconds")
 
 
 def write_json(path, payload):
@@ -52,7 +53,7 @@ def hash_file(path):
 def input_snapshot(args):
     files = []
     for folder, pattern in (("src", "*.py"), ("configs", "*.yaml"), ("configs", "*.json"),
-                            ("scripts/palu_mean_ablation", "*.py")):
+                            ("scripts/palu_mean_ablation", "*.py"), ("scripts/palu_mean_ablation", "*.sh")):
         files.extend((ROOT / folder).rglob(pattern))
     files.extend((ROOT / "data/palu/TOFU" / f"{args.forget_split}_with_common_words_gpt").rglob("*"))
     if args.retain_logs.is_file():
@@ -79,11 +80,13 @@ def validate_overrides(overrides):
                  "trainer.args.do_eval", "trainer.args.do_train", "trainer.args.report_to",
                  "trainer.args.save_strategy", "do_save", "eval", "model",
                  "forget_split", "holdout_split", "retain_split", "trainer.args.deepspeed",
+                 "trainer.method_args.diagnostics", "trainer.method_args.track_loss_components",
                  "model.model_args.device_map", "trainer.args.per_device_train_batch_size",
                  "trainer.args.gradient_accumulation_steps")
     for override in overrides:
         key = override.partition("=")[0].lstrip("+~")
-        if key in protected or any(item.startswith(key + ".") for item in protected) or key.startswith("eval."):
+        if (key in protected or any(item.startswith(key + ".") for item in protected)
+                or key.startswith("eval.") or key.startswith("trainer.method_args.diagnostics.")):
             raise ValueError(f"Override {key} would invalidate the paired protocol")
 
 
@@ -102,11 +105,19 @@ def build_commands(args, run, seed, variant):
              f"trainer.args.learning_rate={args.lr}", f"trainer.args.per_device_train_batch_size={args.batch_size}",
              f"trainer.args.gradient_accumulation_steps={args.grad_accum}", f"trainer.args.num_train_epochs={args.epochs}",
              f"+trainer.args.max_steps={args.max_steps}", f"+trainer.args.max_grad_norm={args.max_grad_norm}",
-             "trainer.args.gradient_checkpointing=true", "trainer.method_args.gamma=1.0",
+             "trainer.args.gradient_checkpointing=true", f"trainer.method_args.gamma={getattr(args, 'gamma', 1.0)}",
              f"trainer.method_args.alpha={args.alpha}", "trainer.method_args.retain_loss_type=NLL",
              f"trainer.method_args.top_k={args.top_k}", f"trainer.method_args.first_n={args.first_n}",
              "trainer.method_args.target_mode=mean",
              assignment("trainer.method_args.detach_mean_target", VARIANTS[variant]), *args.override]
+    if getattr(args, "track_loss_components", True):
+        train.append("+trainer.method_args.track_loss_components=true")
+    if getattr(args, "retain_model_path", None):
+        options = {"cache_path": str(args.output / "reference_cache.pt"),
+                   "cache_sha256": getattr(args, "probe_cache_sha256", None),
+                   "every": args.probe_every, "temperature": args.probe_temperature}
+        train.append("+trainer.method_args.diagnostics=" +
+                     "{" + ",".join(f"{key}:{json.dumps(value, ensure_ascii=False)}" for key, value in options.items()) + "}")
     if args.model_revision:
         train.extend([assignment("+model.model_args.revision", args.model_revision),
                       assignment("+model.tokenizer_args.revision", args.model_revision)])
@@ -211,6 +222,8 @@ def collect_metrics(run, retain_logs, evaluate):
     metrics["seconds_per_optimizer_step"] = last["train_runtime"] / state["global_step"]
     metrics["optimizer_steps"] = state["global_step"]
     metrics["epoch"] = state["epoch"]
+    timing = run / "diagnostic_timing.json"
+    metrics["diagnostic_wall_seconds"] = read_json(timing)["diagnostic_wall_seconds"] if timing.is_file() else 0.0
     if evaluate:
         provenance = read_json(run / "evals/evaluation_provenance.json")
         if provenance["status"] != "completed" or provenance.get("reference_sha256") != hash_file(retain_logs):
@@ -300,8 +313,34 @@ def summarize(output):
 def execute(command, log, env):
     started = time.perf_counter()
     with log.open("w", encoding="utf-8") as stream:
-        completed = subprocess.run(command, cwd=ROOT, env=env, stdout=stream, stderr=subprocess.STDOUT)
-    return completed.returncode, time.perf_counter() - started
+        process = subprocess.Popen(command, cwd=ROOT, env={**env, "PYTHONUNBUFFERED": "1"},
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        try:
+            for line in process.stdout:
+                stream.write(line)
+                stream.flush()
+                print(line, end="", flush=True)
+            returncode = process.wait()
+        finally:
+            process.stdout.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait()
+    return returncode, time.perf_counter() - started
+
+
+def sample_count(value):
+    count = -1 if value == "all" else int(value)
+    if count == 0 or count < -1:
+        raise argparse.ArgumentTypeError("Probe sample count must be positive or all")
+    return count
+
+
+def render_histories(output):
+    # Keep the old model-free driver usable without plotting packages for old results/dry runs.
+    if any(output.glob("seed_*/*/loss_history.jsonl")):
+        from plot_history import render
+        render(output)
 
 
 def parse_args():
@@ -322,6 +361,7 @@ def parse_args():
     parser.add_argument("--retain-split", default="retain95")
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--alpha", type=float, default=0.2)
+    parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=5000)
     parser.add_argument("--first-n", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=1, help="Per-device training batch size")
@@ -335,6 +375,15 @@ def parse_args():
     parser.add_argument("--override", action="append", default=[], help="Shared Hydra override for both arms")
     parser.add_argument("--skip-eval", action="store_true", help="Smoke/performance only; does not measure forgetting")
     parser.add_argument("--dry-run", action="store_true", help="Write the exact plan without loading models")
+    parser.add_argument("--retain-model-path", help="Enable diagnostic KL against this separate Retain-only checkpoint")
+    parser.add_argument("--retain-model-revision", help="Optional immutable Retain-only Hub revision")
+    parser.add_argument("--probe-every", type=int, default=5)
+    parser.add_argument("--probe-forget-samples", type=sample_count, default=32)
+    parser.add_argument("--probe-retain-samples", type=sample_count, default=32)
+    parser.add_argument("--probe-seed", type=int, default=20261011)
+    parser.add_argument("--probe-temperature", type=float, default=1.0)
+    parser.add_argument("--no-loss-history", action="store_false", dest="track_loss_components", default=True,
+                        help="Disable loss history for performance-only measurements")
     args = parser.parse_args()
     if args.summarize:
         return args
@@ -361,6 +410,11 @@ def parse_args():
         parser.error("Batch sizes, top-k, epochs and learning rate must be positive")
     if args.max_steps == 0 or args.max_steps < -1:
         parser.error("--max-steps must be positive or -1")
+    if (args.probe_every <= 0 or not math.isfinite(args.probe_temperature) or args.probe_temperature <= 0
+            or not all(math.isfinite(value) and value >= 0 for value in (args.alpha, args.gamma))):
+        parser.error("Probe interval/temperature must be positive; alpha/gamma must be finite and nonnegative")
+    if args.retain_model_path and not args.track_loss_components:
+        parser.error("Retain-reference diagnostics require loss history")
     try:
         validate_overrides(args.override)
     except ValueError as exc:
@@ -384,6 +438,7 @@ def main():
     args = parse_args()
     if args.summarize:
         report = summarize(args.summarize.expanduser().resolve())
+        render_histories(args.summarize.expanduser().resolve())
         print(f"Report: {args.summarize / 'comparison.md'} ({report['status']})")
         return
     args.output.mkdir(parents=True, exist_ok=False)
@@ -398,12 +453,24 @@ def main():
             train, evaluate = build_commands(args, run, seed, variant)
             manifest["runs"].append({"seed": seed, "variant": variant, "output_dir": str(run),
                                      "train_argv": train, "eval_argv": evaluate})
+    if args.retain_model_path:
+        train = manifest["runs"][0]["train_argv"]
+        request = {"overrides": train[train.index("--config-name=unlearn.yaml") + 1:],
+                   "retain_model_path": args.retain_model_path, "retain_model_revision": args.retain_model_revision,
+                   "probe_seed": args.probe_seed, "forget_samples": args.probe_forget_samples,
+                   "retain_samples": args.probe_retain_samples, "cache_path": str(args.output / "reference_cache.pt")}
+        write_json(args.output / "diagnostic_request.json", request)
+        manifest["reference_precompute_argv"] = [args.python, str(ROOT / "scripts/palu_mean_ablation/prepare_diagnostics.py"),
+                                               "--request", str(args.output / "diagnostic_request.json")]
+        manifest["timing_scope"] = "training runtime includes periodic diagnostics; reference precompute is shared and separate"
     write_json(args.output / "manifest.json", manifest)
     if args.dry_run:
         print(f"Plan: {args.output / 'manifest.json'}")
         print(f"Training GPUs: {args.gpu}; evaluation GPU: {args.gpu.split(',')[0]}; "
               f"effective batch: {args.num_processes} x {args.batch_size} x {args.grad_accum} = {args.effective_batch_size}; "
               f"keep weights: {args.keep_model}")
+        if args.retain_model_path:
+            print("Reference precompute: " + shlex.join(manifest["reference_precompute_argv"]))
         for run in manifest["runs"]:
             print(shlex.join(["env", f"CUDA_VISIBLE_DEVICES={args.gpu}", *run["train_argv"]]))
             if run["eval_argv"]:
@@ -423,10 +490,23 @@ def main():
     code, _ = execute(probe, args.output / "gradient_probe.log", env)
     if code:
         raise RuntimeError(f"Gradient probe failed; see {args.output / 'gradient_probe.log'}")
+    if args.retain_model_path:
+        code, elapsed = execute(manifest["reference_precompute_argv"], args.output / "reference_precompute.log", env)
+        if code:
+            raise RuntimeError(f"Reference precompute failed; see {args.output / 'reference_precompute.log'}")
+        args.probe_cache_sha256 = hash_file(args.output / "reference_cache.pt")
+        manifest["reference_cache"] = read_json(args.output / "reference_cache.json")
+        manifest["reference_precompute_wall_seconds"] = elapsed
+        for planned in manifest["runs"]:
+            planned["train_argv"], planned["eval_argv"] = build_commands(args, Path(planned["output_dir"]),
+                                                                        planned["seed"], planned["variant"])
+        write_json(args.output / "manifest.json", manifest)
     try:
         for planned in manifest["runs"]:
             if input_snapshot(args) != manifest["code_and_data_sha256"]:
                 raise RuntimeError("Experiment source or input data changed during the comparison")
+            if args.retain_model_path and hash_file(args.output / "reference_cache.pt") != args.probe_cache_sha256:
+                raise RuntimeError("Retain reference cache changed during the comparison")
             run = Path(planned["output_dir"])
             run.mkdir(parents=True)
             result = {"seed": planned["seed"], "variant": planned["variant"], "status": "started"}
@@ -456,10 +536,12 @@ def main():
             if all((path / "result.json").is_file() and read_json(path / "result.json").get("status") == "completed"
                    for path in pair_runs):
                 summarize(args.output)
+                render_histories(args.output)
                 for path in pair_runs:
                     cleanup_completed_weights(path, args.keep_model)
     finally:
         summarize(args.output)
+        render_histories(args.output)
     print(f"Comparison: {args.output / 'comparison.md'}")
 
 
