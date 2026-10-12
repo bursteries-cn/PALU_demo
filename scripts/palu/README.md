@@ -29,13 +29,13 @@ SEEDS="0" MAX_STEPS=2 PROBE_EVERY=1 bash scripts/palu/run.sh --skip-eval
 - `DATASET_PATH`：服务器默认 `/mnt/sda/cr/LLM_unlearning/datset/TOFU`，保留实际目录拼写。
 - `CLASSIFIER_MODEL`：流畅度分类器目录。
 
-Retain95 权重默认使用公开的 `open-unlearning/tofu_Llama-3.1-8B-Instruct_retain95`。已下载到服务器时，将 `run.sh` 的对应默认值改为实际本地目录，例如：
+Retain95 权重默认读取仓库下已下载的本地模型目录：
 
 ```bash
 RETAIN_MODEL_PATH="${RETAIN_MODEL_PATH:-${PALU_ROOT}/models/tofu_${MODEL}_${RETAIN_SPLIT}}"
 ```
 
-该目录必须包含完整权重、索引、配置和 tokenizer。评估 JSON 不能替代权重；仅设置离线模式也不能补齐缺失文件。参考模型、评估 JSON 和 Forget/Retain split 应匹配。
+服务器默认目录为 `/mnt/sda/cr/LLM_unlearning/PALU/models/tofu_Llama-3.1-8B-Instruct_retain95`，可通过 `RETAIN_MODEL_PATH` 覆盖。该目录必须包含完整权重、索引、配置和 tokenizer。评估 JSON 不能替代权重；仅设置离线模式也不能补齐缺失文件。参考模型、评估 JSON 和 Forget/Retain split 应匹配。
 
 ## 四条训练损失曲线
 
