@@ -1,5 +1,16 @@
 # PALU 单组诊断基线验证
 
+## 2026-10-13：experiment 层级与同组 seed 汇总
+
+按用户确认，同组 seed 共用时间戳，新增默认路径 `artifacts/palu/<experiment>/<北京时间戳>/seed_<seed>`。相同配置且 seed 不重复的独立启动会加入最新匹配组；重复 seed、科学配置变化或 `NEW_GROUP=1` 另开时间戳。实验内容通过 bash 的 `EXPERIMENT` 设置。
+
+- 全部 42 项 CPU 回归测试通过，日志 `/private/tmp/palu-experiment-layout-tests-20261013.log`。覆盖跨启动分组、GPU 编号来源记录、不同配置/源码分组、重复 seed 不覆盖、手动新组、并行 seed 注册和 manifest 更新不丢失。
+- 随后补充“最新组已有重复 seed 时不得回填更旧组”的断言；6 项目录/分组测试通过，日志 `/private/tmp/palu-experiment-layout-targeted-20261013.log`。
+- 通过实际启动、独立参考预计算和训练入口，分三次运行微型模型 seed 0/1/2，各 2 个 CPU 优化步。三次启动使用不同可见 GPU 编号（CPU 模式），均加入 `artifacts/palu/local_validation_seed_group_20261013/20261013_044336_319802/`，保存 3 份 seed 产物、3 条启动来源记录和同一份参考缓存，汇总状态 completed。
+- 共 26 条逐步曲线统计均为 n=3，均值和点态 95% Student-t 置信区间完整；PNG/PDF 与实验名称/探针位置图注已检查。成功完成后的微型模型权重按默认设置清理。
+
+本次没有重跑 8B 模型或新的 FQ/MU 实验。以下为此前探针及基线实现的历史验证。
+
 ## 2026-10-13：Forget 探针改为首个敏感 token
 
 Forget 提取 `h[first_sensitive-1]`，Retain 保持 `h[first_answer-1]`。参考缓存升级为 schema 2，旧缓存明确拒绝；历史曲线仍按旧位置标注，新旧位置不能合并聚合。

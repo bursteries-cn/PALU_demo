@@ -111,9 +111,15 @@ class ExperimentProtocolTests(unittest.TestCase):
             report = summarize(root)
             self.assertEqual(report["status"], "completed")
             self.assertAlmostEqual(report["aggregate"]["forget_quality"]["mean"], .5)
+            self.assertAlmostEqual(report["aggregate"]["forget_quality"]["ci95_half_width"], 1.27062047, places=6)
             self.assertEqual(report["aggregate"]["train_runtime"]["mean"], 17.5)
             self.assertEqual(report["aggregate"]["train_runtime"]["n"], 2)
             self.assertTrue((root / "summary.csv").exists())
+            for run, ordinal in ((first, "2"), (second, "7")):
+                telemetry = json.loads((run / "telemetry.json").read_text())
+                telemetry["cuda_visible_devices"] = ordinal
+                write_json(run / "telemetry.json", telemetry)
+            self.assertEqual(summarize(root)["aggregate"]["forget_quality"]["n"], 2)
             cfg = json.loads((second / "resolved_config.json").read_text())
             cfg["trainer"]["args"]["learning_rate"] *= 2
             write_json(second / "resolved_config.json", cfg)

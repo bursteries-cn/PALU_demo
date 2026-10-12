@@ -10,10 +10,11 @@
 bash scripts/palu/run.sh
 ```
 
-主要设置：`GPU_IDS`、`SEEDS`、`LR`、`ALPHA`、`GAMMA`、`TOP_K`、`FIRST_N`、`EPOCHS`、`MAX_STEPS`、`BATCH_SIZE`、`GRAD_ACCUM`。也可以临时覆盖：
+主要设置：`EXPERIMENT`（实验内容名称）、`OUTPUT_ROOT`（baseline 保存根目录）、`GPU_IDS`、`SEEDS`、`LR`、`ALPHA`、`GAMMA`、`TOP_K`、`FIRST_N`、`EPOCHS`、`MAX_STEPS`、`BATCH_SIZE`、`GRAD_ACCUM`。也可以临时覆盖：
 
 ```bash
 LR=1e-5 ALPHA=0.3 bash scripts/palu/run.sh
+EXPERIMENT=batch8_first_sensitive SEEDS="0 1 2" bash scripts/palu/run.sh
 bash scripts/palu/run.sh --dry-run
 SEEDS="0" MAX_STEPS=2 PROBE_EVERY=1 bash scripts/palu/run.sh --skip-eval
 ```
@@ -77,7 +78,36 @@ Retain95 表征在训练前独立预计算并缓存，进程退出后才启动�
 
 ## 输出、评估与多 GPU
 
-输出根目录为 `artifacts/palu/<split>_<时间>_<PID>/`，也可设置 `OUTPUT_DIR`。每次使用新目录，避免混入历史结果。
+默认采用 `{baseline}/{experiment}/{time}/{seed}` 四级路径，其中 baseline 根目录为 `artifacts/palu`，experiment 默认 `forget05_first_sensitive`，时间戳使用北京时间并包含微秒：
+
+```text
+artifacts/palu/
+└── batch8_first_sensitive/             # EXPERIMENT：描述实验内容
+    └── 20261013_120000_123456/         # 同一组 seed 共用时间戳
+        ├── seed_0/
+        ├── seed_1/
+        ├── seed_2/
+        ├── manifest.json
+        ├── summary.csv / json / md
+        ├── reference_cache.pt / json
+        └── plots/
+```
+
+在 `run.sh` 设置 `OUTPUT_ROOT` 和 `EXPERIMENT` 即可使用新目录。一次设置 `SEEDS="0 1 2"` 会直接建立同组目录；分开启动时，相同实验名、相同配置且 seed 不重复的运行也会自动加入最新匹配时间戳：
+
+```bash
+EXPERIMENT=batch8_first_sensitive SEEDS="0" GPU_IDS=2 bash scripts/palu/run.sh
+EXPERIMENT=batch8_first_sensitive SEEDS="1" GPU_IDS=7 bash scripts/palu/run.sh
+EXPERIMENT=batch8_first_sensitive SEEDS="2" GPU_IDS=5 bash scripts/palu/run.sh
+```
+
+这三个命令的其余参数需一致。GPU 编号可以不同，GPU 型号、软件环境和训练拓扑仍会校验。匹配包含学习率、损失权重、微批次/梯度累计/进程数、模型路径/revision、数据与源码哈希、评估设置以及探针设置。改变 bash 的 seed 默认值不会单独改变分组。改变科学配置或重复同一 seed 会新建时间戳，不会覆盖已有结果；`NEW_GROUP=1`（CLI `--new-group`）可主动开启新组。
+
+同组共享参考缓存；分开或并行启动时，文件锁保护 seed 注册、缓存预计算和汇总绘图。每个 driver 只训练本次请求的 seed，不会重新训练同组已有 seed。`manifest.json` 的 `launches` 保存每次启动的设置与源码/数据快照，各 run 记录自己的 GPU 编号。
+
+汇总图保存在同一时间戳下的 `plots/`，每个点为该步各 seed 的均值，T 型误差棒为点态 95% Student-t 置信区间。`summary.json/md` 也报告指标均值和置信区间；单个 seed 时 CI 为空。尚未完成的 seed 不会伪造观测，图注显示实际 n。旧目录及曲线保留原样，不会自动移动或并入新组。
+
+`OUTPUT_DIR` 或 CLI `--output` 仍支持旧的精确输出目录覆盖方式；使用新四级路径时请保持 `OUTPUT_DIR` 为空。`--dry-run` 独立生成计划目录，不占用实际实验组的 seed。
 
 - `manifest.json`：参数、seed、完整命令、源码和输入哈希、可选参考预计算信息。
 - `seed_<seed>/`：训练/评估日志、解析配置、运行时间和显存、`result.json`、`loss_history.jsonl/csv`。
@@ -94,8 +124,8 @@ Retain95 表征在训练前独立预计算并缓存，进程退出后才启动�
 重建报告或重画图：
 
 ```bash
-python scripts/palu/run_experiment.py --summarize artifacts/palu/<本次输出目录>
-python scripts/palu/plot_history.py artifacts/palu/<本次输出目录>
+python scripts/palu/run_experiment.py --summarize artifacts/palu/<experiment>/<time>
+python scripts/palu/plot_history.py artifacts/palu/<experiment>/<time>
 ```
 
 旧双组实验目录请在原分支用原脚本读取，不要与新单组目录混合。

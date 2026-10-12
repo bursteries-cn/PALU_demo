@@ -6,7 +6,6 @@ import json
 import math
 import os
 from pathlib import Path
-import statistics
 import tempfile
 
 # Use a writable cache and a non-interactive backend on servers.
@@ -14,24 +13,13 @@ os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "palu-ma
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.stats import t
+from experiment_layout import file_lock, mean_interval
 
 LOSSES = (("loss_total", "Total", "#222222"), ("loss_forget", "Forget (weighted)", "#D55E00"),
           ("loss_retain_nll", "Retain NLL (weighted)", "#0072B2"),
           ("loss_common_kl", "Common-token KL (weighted)", "#009E73"))
 KLS = (("forget_repr_kl", "Forget: KL(Retain || current)", "#D55E00"),
        ("retain_repr_kl", "Retain: KL(Retain || current)", "#0072B2"))
-
-
-def mean_interval(values):
-    if not values or not all(math.isfinite(value) for value in values):
-        raise ValueError("Confidence interval requires finite observations")
-    n, mean = len(values), statistics.mean(values)
-    std = statistics.stdev(values) if n >= 2 else None
-    half = float(t.ppf(.975, n - 1)) * std / math.sqrt(n) if std is not None else None
-    return {"n": n, "mean": mean, "sample_stddev": std, "ci95_half_width": half,
-            "ci95_low": mean - half if half is not None else None,
-            "ci95_high": mean + half if half is not None else None}
 
 
 def read_history(path):
@@ -159,10 +147,12 @@ def render(root):
     write_csv(output / "trend_intervals.csv", trend_intervals(probes, seeds))
     footnote = ("Points: mean across available training seeds. Caps: pointwise 95% Student-t CI; no CI for n=1.\n"
                 "Raw steps, no smoothing/interpolation. CIs describe seed variability, not simultaneous curve coverage.")
+    experiment = manifest.get("layout", {}).get("experiment")
+    title_prefix = f"Experiment: {experiment}\n" if experiment else ""
     if train_rows:
         fig, ax = plt.subplots(figsize=(9, 5.5))
         draw(ax, train_rows, LOSSES, "Training loss (weighted components)")
-        fig.suptitle("PALU training losses: total = forget + retain NLL + common-token KL", fontsize=12)
+        fig.suptitle(title_prefix + "PALU training losses: total = forget + retain NLL + common-token KL", fontsize=11)
         fig.text(.5, .015, footnote, ha="center", fontsize=8)
         fig.tight_layout(rect=(0, .10, 1, .94))
         for extension in ("png", "pdf"):
@@ -172,9 +162,9 @@ def render(root):
         fig, axes = plt.subplots(2, 1, figsize=(9, 9), sharex=True)
         draw(axes[0], probe_rows, LOSSES, "Fixed-probe loss (per-example mean)")
         draw(axes[1], probe_rows, KLS, "Pre-head representation KL (nats)")
-        fig.suptitle("Same fixed training examples and post-update state\n" + position_caption, fontsize=11)
+        fig.suptitle(title_prefix + "Same fixed training examples and post-update state\n" + position_caption, fontsize=10)
         fig.text(.5, .015, footnote, ha="center", fontsize=8)
-        fig.tight_layout(rect=(0, .07, 1, .96))
+        fig.tight_layout(rect=(0, .07, 1, .94 if experiment else .96))
         for extension in ("png", "pdf"):
             fig.savefig(output / f"loss_vs_retain_kl.{extension}", dpi=300)
         plt.close(fig)
@@ -191,7 +181,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
     args = parser.parse_args()
-    print(f"Plots: {render(args.root) or 'no component histories yet'}")
+    with file_lock(args.root / ".manifest.lock"):
+        print(f"Plots: {render(args.root) or 'no component histories yet'}")
 
 
 if __name__ == "__main__":

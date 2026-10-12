@@ -43,14 +43,18 @@ PROBE_FORGET_SAMPLES="${PROBE_FORGET_SAMPLES:-32}" # Positive integer or all.
 PROBE_RETAIN_SAMPLES="${PROBE_RETAIN_SAMPLES:-32}"
 PROBE_SEED="${PROBE_SEED:-20261011}"
 PROBE_TEMPERATURE="${PROBE_TEMPERATURE:-1.0}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PALU_ROOT}/artifacts/palu/${FORGET_SPLIT}_$(TZ=Asia/Shanghai date +%Y%m%d_%H%M%S)_$$}"
-for FLAG in "$KEEP_MODEL" "$LOSS_HISTORY" "$DIAGNOSTICS"; do
-  case "$FLAG" in 0|1) ;; *) printf 'KEEP_MODEL, LOSS_HISTORY and DIAGNOSTICS must be 0 or 1\n' >&2; exit 2 ;; esac
+# Saving: {baseline}/{experiment}/{time}/seed_<seed>; matching new seeds share time.
+OUTPUT_ROOT="${OUTPUT_ROOT:-${PALU_ROOT}/artifacts/palu}"
+EXPERIMENT="${EXPERIMENT:-${FORGET_SPLIT}_first_sensitive}"
+NEW_GROUP="${NEW_GROUP:-0}" # 1: start a fresh timestamp, even when matching seeds can join.
+OUTPUT_DIR="${OUTPUT_DIR:-}" # Optional legacy exact directory override.
+for FLAG in "$KEEP_MODEL" "$LOSS_HISTORY" "$DIAGNOSTICS" "$NEW_GROUP"; do
+  case "$FLAG" in 0|1) ;; *) printf 'KEEP_MODEL, LOSS_HISTORY, DIAGNOSTICS and NEW_GROUP must be 0 or 1\n' >&2; exit 2 ;; esac
 done
 
 read -r -a SEED_ARRAY <<< "$SEEDS"
 COMMAND=("$PYTHON_BIN" "$PALU_ROOT/scripts/palu/run_experiment.py"
-  --output "$OUTPUT_DIR" --gpu "$GPU_IDS" --seeds "${SEED_ARRAY[@]}"
+  --output-root "$OUTPUT_ROOT" --experiment "$EXPERIMENT" --gpu "$GPU_IDS" --seeds "${SEED_ARRAY[@]}"
   --model "$MODEL" --model-path "$MODEL_PATH" --retain-logs "$RETAIN_LOGS"
   --forget-split "$FORGET_SPLIT" --retain-split "$RETAIN_SPLIT" --holdout-split "$HOLDOUT_SPLIT"
   --lr "$LR" --alpha "$ALPHA" --gamma "$GAMMA" --top-k "$TOP_K" --first-n "$FIRST_N"
@@ -59,6 +63,8 @@ COMMAND=("$PYTHON_BIN" "$PALU_ROOT/scripts/palu/run_experiment.py"
   --eval-batch-size "$EVAL_BATCH_SIZE" --eval-dataset "$DATASET_PATH" --classifier-model "$CLASSIFIER_MODEL"
   --override "data.retain.TOFU_QA_retain.args.hf_args.path=\"${DATASET_PATH}\"")
 [[ -z "$GRAD_ACCUM" ]] || COMMAND+=(--grad-accum "$GRAD_ACCUM")
+[[ -z "$OUTPUT_DIR" ]] || COMMAND+=(--output "$OUTPUT_DIR")
+[[ "$NEW_GROUP" == 0 ]] || COMMAND+=(--new-group)
 [[ -z "$MODEL_REVISION" ]] || COMMAND+=(--model-revision "$MODEL_REVISION")
 [[ "$KEEP_MODEL" == 0 ]] || COMMAND+=(--keep-model)
 [[ "$LOSS_HISTORY" == 1 ]] || COMMAND+=(--no-loss-history)
@@ -69,6 +75,6 @@ if [[ "$DIAGNOSTICS" == 1 ]]; then
   [[ -z "$RETAIN_MODEL_REVISION" ]] || COMMAND+=(--retain-model-revision "$RETAIN_MODEL_REVISION")
 fi
 export PYTHONUNBUFFERED=1
-printf 'Output: %s\nGPUs: %s; seeds: %s; LR: %s; alpha: %s; gamma: %s\n' \
-  "$OUTPUT_DIR" "$GPU_IDS" "$SEEDS" "$LR" "$ALPHA" "$GAMMA"
+printf 'Baseline: %s; experiment: %s\nGPUs: %s; seeds: %s; LR: %s; alpha: %s; gamma: %s\n' \
+  "$OUTPUT_ROOT" "$EXPERIMENT" "$GPU_IDS" "$SEEDS" "$LR" "$ALPHA" "$GAMMA"
 exec "${COMMAND[@]}" "$@"

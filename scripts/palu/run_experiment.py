@@ -4,7 +4,6 @@ import argparse
 from bisect import bisect_right
 import copy
 import csv
-from datetime import datetime
 import hashlib
 import json
 import math
@@ -12,10 +11,11 @@ import os
 from pathlib import Path
 import re
 import shlex
-import statistics
 import subprocess
 import sys
 import time
+from experiment_layout import (LAYOUT_SCHEMA, experiment_name, file_lock, mean_interval,
+                               protocol_id, timestamp_directory)
 
 ROOT = Path(__file__).resolve().parents[2]
 WEIGHT_FILE = re.compile(r"(?:model(?:-\d+-of-\d+)?\.safetensors(?:\.index\.json)?|"
@@ -30,11 +30,80 @@ PERFORMANCE_METRICS = ("train_runtime", "train_steps_per_second", "seconds_per_o
 
 def write_json(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def register_launch(args):
+    """Reserve unique seeds, joining the newest matching timestamp when possible."""
+    snapshot = input_snapshot(args)
+    def settings():
+        return {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+    identifier = protocol_id({"settings": settings(), "code_and_data_sha256": snapshot})
+    structured = args.output is None
+    experiment = args.output_root / args.experiment
+    if structured:
+        experiment.mkdir(parents=True, exist_ok=True)
+    with file_lock(experiment / ".groups.lock" if structured else args.output.parent / ".palu-output.lock"):
+        existing = None
+        if structured and not args.dry_run and not args.new_group:
+            for path in sorted(experiment.glob("*/manifest.json"), reverse=True):
+                candidate = read_json(path)
+                if (candidate.get("layout", {}).get("config_id") == identifier
+                        and not candidate["settings"].get("dry_run")):
+                    if protocol_id(candidate) != identifier:
+                        raise ValueError(f"Stored experiment protocol changed: {path}")
+                    if not set(args.seeds).intersection(candidate["seeds"]):
+                        args.output, existing = path.parent, candidate
+                    break
+        if structured and existing is None:
+            args.output = timestamp_directory(experiment)
+        if existing is None:
+            args.output.mkdir(parents=True, exist_ok=False)
+        planned = []
+        for seed in args.seeds:
+            run = args.output / f"seed_{seed}"
+            train, evaluate = build_commands(args, run, seed)
+            planned.append({"seed": seed, "output_dir": str(run), "train_argv": train, "eval_argv": evaluate,
+                            "train_cuda_visible_devices": args.gpu, "eval_cuda_visible_devices": args.gpu.split(",")[0]})
+        with file_lock(args.output / ".manifest.lock"):
+            manifest = read_json(args.output / "manifest.json") if existing is not None else {
+                "seeds": [], "runs": [], "launches": [], "evaluation_enabled": not args.skip_eval,
+                "train_cuda_visible_devices": args.gpu, "eval_cuda_visible_devices": args.gpu.split(",")[0],
+                "settings": settings(), "code_and_data_sha256": snapshot}
+            manifest["seeds"] = sorted(set(manifest["seeds"]) | set(args.seeds))
+            manifest["settings"]["seeds"] = manifest["seeds"]
+            manifest["runs"].extend(planned)
+            manifest["runs"].sort(key=lambda run: run["seed"])
+            manifest["launches"].append({"settings": settings(), "code_and_data_sha256": snapshot})
+            if structured:
+                manifest["layout"] = {"schema": LAYOUT_SCHEMA, "baseline": str(args.output_root),
+                    "experiment": args.experiment, "config_id": identifier, "seed_grouping": "shared_timestamp"}
+            write_json(args.output / "manifest.json", manifest)
+    return manifest, planned, snapshot
+
+
+def update_manifest(output, planned=None, **updates):
+    with file_lock(output / ".manifest.lock"):
+        manifest = read_json(output / "manifest.json")
+        if planned is not None:
+            replacements = {run["seed"]: run for run in planned}
+            manifest["runs"] = [replacements.get(run["seed"], run) for run in manifest["runs"]]
+        manifest.update(updates)
+        write_json(output / "manifest.json", manifest)
+    return manifest
+
+
+def update_reports(output):
+    with file_lock(output / ".manifest.lock"):
+        report = summarize(output)
+        render_histories(output)
+    return report
 
 
 def assignment(key, value):
@@ -264,7 +333,7 @@ def summarize(output):
                 raise ValueError("Resolved seed configs differ beyond seed and output paths")
             if steps != first_steps:
                 raise ValueError("Optimizer step counts differ across seeds")
-            for key in ("packages", "cuda_available", "cuda_version", "gpu_name", "cuda_visible_devices",
+            for key in ("packages", "cuda_available", "cuda_version", "gpu_name",
                         "world_size", "gpu_names_by_rank"):
                 if telemetry.get(key) != first_telemetry.get(key):
                     raise ValueError(f"Runtime environment differs across seeds: {key}")
@@ -275,8 +344,7 @@ def summarize(output):
     for key in (*QUALITY_METRICS, *PERFORMANCE_METRICS):
         values = [item[key] for item in rows if item.get(key) is not None]
         if values:
-            aggregate[key] = {"n": len(values), "mean": statistics.mean(values),
-                              "sample_stddev": statistics.stdev(values) if len(values) > 1 else None}
+            aggregate[key] = mean_interval(values)
     result = {"status": "completed" if not missing else "incomplete", "rows": rows,
               "aggregate": aggregate, "missing_runs": missing,
               "scope": "TOFU PALU experiment" if manifest["evaluation_enabled"] else "training smoke/performance only; no forgetting evaluation"}
@@ -291,11 +359,12 @@ def summarize(output):
              "Values below are means across training seeds. FQ is a KS p-value; it is not an erasure percentage.",
              "Training runtime excludes evaluation; entrypoint wall time also includes setup and final save.", "",
              "GPU memory metrics are the maximum per-rank allocator peak; evaluation uses one GPU.", "",
-             "| Metric | Mean | Sample stddev | n |", "|---|---:|---:|---:|"]
+             "| Metric | Mean | 95% CI | Sample stddev | n |", "|---|---:|---:|---:|---:|"]
     for key, values in aggregate.items():
         std = values["sample_stddev"]
-        lines.append(f"| {key} | {values['mean']:.6g} | {std:.6g} | {values['n']} |"
-                     if std is not None else f"| {key} | {values['mean']:.6g} | — | {values['n']} |")
+        ci = f"[{values['ci95_low']:.6g}, {values['ci95_high']:.6g}]" if std is not None else "—"
+        std_text = f"{std:.6g}" if std is not None else "—"
+        lines.append(f"| {key} | {values['mean']:.6g} | {ci} | {std_text} | {values['n']} |")
     if missing:
         lines += ["", f"Missing/incomplete runs: {json.dumps(missing)}"]
     (output / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -338,7 +407,10 @@ def render_histories(output):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--summarize", type=Path, help="Rebuild reports without running any training")
-    parser.add_argument("--output", type=Path, default=ROOT / "artifacts/palu" / datetime.now().strftime("%Y%m%d_%H%M%S"))
+    parser.add_argument("--output", type=Path, help="Legacy exact output directory; prefer --output-root and --experiment")
+    parser.add_argument("--output-root", type=Path, default=ROOT / "artifacts/palu", help="Baseline directory")
+    parser.add_argument("--experiment", help="Experiment description used as one directory level")
+    parser.add_argument("--new-group", action="store_true", help="Create a fresh timestamp instead of joining matching seeds")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--gpu", default="0,1,2,3", help="Visible GPU IDs; multi-GPU training uses ZeRO-3, evaluation uses the first GPU")
     parser.add_argument("--main-process-port", type=int, default=29513)
@@ -412,7 +484,12 @@ def parse_args():
     except ValueError as exc:
         parser.error(str(exc))
     args.model_path = args.model_path or f"open-unlearning/tofu_{args.model}_full"
-    args.output = args.output.expanduser().resolve()
+    args.output = args.output.expanduser().resolve() if args.output is not None else None
+    args.output_root = args.output_root.expanduser().resolve()
+    try:
+        args.experiment = experiment_name(args.experiment or f"{args.forget_split}_first_sensitive")
+    except ValueError as exc:
+        parser.error(str(exc))
     args.retain_logs = (args.retain_logs or ROOT / f"saves/eval/tofu_{args.model}_{args.retain_split}/TOFU_EVAL.json").expanduser().resolve()
     if not args.dry_run and not args.skip_eval:
         if not args.retain_logs.is_file():
@@ -429,31 +506,25 @@ def parse_args():
 def main():
     args = parse_args()
     if args.summarize:
-        report = summarize(args.summarize.expanduser().resolve())
-        render_histories(args.summarize.expanduser().resolve())
+        report = update_reports(args.summarize.expanduser().resolve())
         print(f"Report: {args.summarize / 'summary.md'} ({report['status']})")
         return
-    args.output.mkdir(parents=True, exist_ok=False)
-    manifest = {"seeds": args.seeds, "evaluation_enabled": not args.skip_eval,
-                "train_cuda_visible_devices": args.gpu, "eval_cuda_visible_devices": args.gpu.split(",")[0],
-                "settings": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
-                "code_and_data_sha256": input_snapshot(args), "runs": []}
-    for seed in args.seeds:
-        run = args.output / f"seed_{seed}"
-        train, evaluate = build_commands(args, run, seed)
-        manifest["runs"].append({"seed": seed, "output_dir": str(run),
-                                 "train_argv": train, "eval_argv": evaluate})
+    manifest, planned_runs, launch_snapshot = register_launch(args)
+    print(f"Output group: {args.output}; registered seeds: {manifest['seeds']}", flush=True)
     if args.retain_model_path:
-        train = manifest["runs"][0]["train_argv"]
+        train = planned_runs[0]["train_argv"]
         request = {"overrides": train[train.index("--config-name=unlearn.yaml") + 1:],
                    "retain_model_path": args.retain_model_path, "retain_model_revision": args.retain_model_revision,
                    "probe_seed": args.probe_seed, "forget_samples": args.probe_forget_samples,
                    "retain_samples": args.probe_retain_samples, "cache_path": str(args.output / "reference_cache.pt")}
-        write_json(args.output / "diagnostic_request.json", request)
         manifest["reference_precompute_argv"] = [args.python, str(ROOT / "scripts/palu/prepare_diagnostics.py"),
                                                "--request", str(args.output / "diagnostic_request.json")]
         manifest["timing_scope"] = "training runtime includes periodic diagnostics; reference precompute is shared and separate"
-    write_json(args.output / "manifest.json", manifest)
+        with file_lock(args.output / ".reference.lock"):
+            if not (args.output / "diagnostic_request.json").exists():
+                write_json(args.output / "diagnostic_request.json", request)
+        update_manifest(args.output, reference_precompute_argv=manifest["reference_precompute_argv"],
+                        timing_scope=manifest["timing_scope"])
     if args.dry_run:
         print(f"Plan: {args.output / 'manifest.json'}")
         print(f"Training GPUs: {args.gpu}; evaluation GPU: {args.gpu.split(',')[0]}; "
@@ -461,7 +532,7 @@ def main():
               f"keep weights: {args.keep_model}")
         if args.retain_model_path:
             print("Reference precompute: " + shlex.join(manifest["reference_precompute_argv"]))
-        for run in manifest["runs"]:
+        for run in planned_runs:
             print(shlex.join(["env", f"CUDA_VISIBLE_DEVICES={args.gpu}", *run["train_argv"]]))
             if run["eval_argv"]:
                 print(shlex.join(["env", f"CUDA_VISIBLE_DEVICES={args.gpu.split(',')[0]}", *run["eval_argv"]]))
@@ -472,23 +543,35 @@ def main():
         preflight = [args.python, "-c", "import importlib.metadata, torch; "
                      f"assert torch.cuda.is_available() and torch.cuda.device_count() == {args.num_processes}, "
                      "'Requested GPUs are not all available'; print('DeepSpeed:', importlib.metadata.version('deepspeed'))"]
-        code, _ = execute(preflight, args.output / "environment_check.log", env)
+        environment_log = args.output / f"environment_check.seed_{args.seeds[0]}.log"
+        code, _ = execute(preflight, environment_log, env)
         if code:
-            raise RuntimeError(f"Multi-GPU environment check failed; see {args.output / 'environment_check.log'}")
+            raise RuntimeError(f"Multi-GPU environment check failed; see {environment_log}")
     if args.retain_model_path:
-        code, elapsed = execute(manifest["reference_precompute_argv"], args.output / "reference_precompute.log", env)
-        if code:
-            raise RuntimeError(f"Reference precompute failed; see {args.output / 'reference_precompute.log'}")
-        args.probe_cache_sha256 = hash_file(args.output / "reference_cache.pt")
-        manifest["reference_cache"] = read_json(args.output / "reference_cache.json")
-        manifest["reference_precompute_wall_seconds"] = elapsed
-        for planned in manifest["runs"]:
+        print("Preparing or waiting for the group's shared Retain reference cache", flush=True)
+        with file_lock(args.output / ".reference.lock"):
+            cache = args.output / "reference_cache.pt"
+            if not cache.exists():
+                code, elapsed = execute(manifest["reference_precompute_argv"], args.output / "reference_precompute.log", env)
+                if code:
+                    raise RuntimeError(f"Reference precompute failed; see {args.output / 'reference_precompute.log'}")
+            else:
+                elapsed = None
+            args.probe_cache_sha256 = hash_file(cache)
+            metadata = read_json(args.output / "reference_cache.json")
+            if metadata.get("cache_sha256") != args.probe_cache_sha256:
+                raise RuntimeError("The group's reference cache hash is invalid")
+            updates = {"reference_cache": metadata}
+            if elapsed is not None:
+                updates["reference_precompute_wall_seconds"] = elapsed
+            update_manifest(args.output, **updates)
+        for planned in planned_runs:
             planned["train_argv"], planned["eval_argv"] = build_commands(args, Path(planned["output_dir"]),
                                                                         planned["seed"])
-        write_json(args.output / "manifest.json", manifest)
+        update_manifest(args.output, planned_runs)
     try:
-        for planned in manifest["runs"]:
-            if input_snapshot(args) != manifest["code_and_data_sha256"]:
+        for planned in planned_runs:
+            if input_snapshot(args) != launch_snapshot:
                 raise RuntimeError("Experiment source or input data changed during the run")
             if args.retain_model_path and hash_file(args.output / "reference_cache.pt") != args.probe_cache_sha256:
                 raise RuntimeError("Retain reference cache changed during the run")
@@ -512,17 +595,15 @@ def main():
                     result["status"] = "eval_failed"
                     write_json(run / "result.json", result)
                     raise RuntimeError(f"Evaluation failed; see {run / 'eval.log'}")
-            if input_snapshot(args) != manifest["code_and_data_sha256"]:
+            if input_snapshot(args) != launch_snapshot:
                 raise RuntimeError("Experiment source or input data changed during the run")
             result["metrics"] = collect_metrics(run, args.retain_logs, planned["eval_argv"] is not None)
             result["status"] = "completed"
             write_json(run / "result.json", result)
-            summarize(args.output)
-            render_histories(args.output)
+            update_reports(args.output)
             cleanup_completed_weights(run, args.keep_model)
     finally:
-        summarize(args.output)
-        render_histories(args.output)
+        update_reports(args.output)
     print(f"Report: {args.output / 'summary.md'}")
 
 
