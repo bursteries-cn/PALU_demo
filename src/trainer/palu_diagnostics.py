@@ -16,6 +16,8 @@ from transformers import TrainerCallback
 
 LOSS_KEYS = ("loss_total", "loss_forget", "loss_retain_nll", "loss_common_kl",
              "raw_sensitive_loss", "raw_retain_nll", "raw_common_kl")
+PROBE_CACHE_SCHEMA = 2
+PROBE_POSITIONS = {"forget": "first_sensitive", "retain": "first_answer"}
 
 
 def sha256_file(path):
@@ -32,18 +34,25 @@ def tokenizer_fingerprint(tokenizer):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def answer_prediction_positions(labels, attention_mask, input_ids, eos_token_id=None):
-    """Index h[a-1], including ordinary (-200) answer tokens; reject missing answers."""
+def probe_prediction_positions(labels, attention_mask, input_ids, eos_token_id=None, *, position):
+    """Select h[t-1] for the first sensitive or answer token in each sequence."""
+    if position not in ("first_sensitive", "first_answer"):
+        raise ValueError(f"Unknown diagnostic token position: {position}")
+    sensitive = position == "first_sensitive"
     positions = []
     for label, mask, ids in zip(labels, attention_mask, input_ids):
-        answer = torch.nonzero((label != -100) & mask.bool(), as_tuple=False).flatten()
-        if not len(answer):
-            raise ValueError("No answer token remains after masking/truncation")
-        start = int(answer[0])
+        valid = (label >= 0 if sensitive else label != -100) & mask.bool()
+        if sensitive and eos_token_id is not None:
+            valid &= label != eos_token_id  # Match PALU's sensitive mask; EOS is not a target.
+        targets = torch.nonzero(valid, as_tuple=False).flatten()
+        target_name = "sensitive" if sensitive else "answer"
+        if not len(targets):
+            raise ValueError(f"No {target_name} token remains after masking/truncation")
+        start = int(targets[0])
         if start == 0 or not bool(mask[start - 1]):
-            raise ValueError("First answer token has no valid preceding prompt token")
+            raise ValueError(f"First {target_name} token has no valid preceding context token")
         if eos_token_id is not None and int(ids[start]) == eos_token_id:
-            raise ValueError("First answer token is EOS")
+            raise ValueError(f"First {target_name} token is EOS")
         positions.append(start - 1)
     return torch.tensor(positions, device=labels.device, dtype=torch.long)
 
@@ -157,8 +166,8 @@ class PaluMonitor(TrainerCallback):
     def _validate_cache(self):
         metadata = self.cache["metadata"]
         model = self.trainer.accelerator.unwrap_model(self.trainer.model_wrapped)
-        if metadata.get("schema") != 1 or metadata.get("position") != "predict_first_answer":
-            raise ValueError("Unsupported reference cache schema or token position")
+        if metadata.get("schema") != PROBE_CACHE_SCHEMA or metadata.get("positions") != PROBE_POSITIONS:
+            raise ValueError("Reference cache uses an outdated schema or token position; regenerate it in a new run")
         if metadata["tokenizer_sha256"] != tokenizer_fingerprint(self.trainer.tokenizer):
             raise ValueError("Diagnostic cache tokenizer differs from training")
         for key in ("model_type", "hidden_size", "vocab_size"):
@@ -177,10 +186,10 @@ class PaluMonitor(TrainerCallback):
                 for key in ("input_ids", "labels", "attention_mask"):
                     if not torch.equal(actual_batch[key][0].cpu(), cached[key]):
                         raise ValueError(f"Diagnostic cache input differs: {split}/{cached['dataset_index']}/{key}")
-                positions = answer_prediction_positions(cached["labels"][None], cached["attention_mask"][None],
-                    cached["input_ids"][None], self.trainer.tokenizer.eos_token_id)
+                positions = probe_prediction_positions(cached["labels"][None], cached["attention_mask"][None],
+                    cached["input_ids"][None], self.trainer.tokenizer.eos_token_id, position=PROBE_POSITIONS[split])
                 if int(positions[0]) != cached["prediction_index"]:
-                    raise ValueError("Diagnostic cache answer position differs")
+                    raise ValueError(f"Diagnostic cache {split} prediction position differs")
                 if cached["reference_hidden"].shape != (model.config.hidden_size,):
                     raise ValueError("Invalid cached hidden representation")
 
@@ -228,8 +237,9 @@ class PaluMonitor(TrainerCallback):
                     batch = trainer.data_collator([{split: {key: value[key] for key in ("input_ids", "labels")}
                                                     for split, value in chosen.items()}])
                     batch = trainer._prepare_inputs(batch)
-                    positions = [answer_prediction_positions(batch[split]["labels"], batch[split]["attention_mask"],
-                        batch[split]["input_ids"], trainer.tokenizer.eos_token_id) for split in ("forget", "retain")]
+                    positions = [probe_prediction_positions(batch[split]["labels"], batch[split]["attention_mask"],
+                        batch[split]["input_ids"], trainer.tokenizer.eos_token_id, position=PROBE_POSITIONS[split])
+                        for split in ("forget", "retain")]
                     with capture_pre_head(unwrapped, positions) as hidden, trainer.compute_loss_context_manager():
                         trainer.compute_loss(model, batch)
                     if len(hidden) != 2:
@@ -245,6 +255,7 @@ class PaluMonitor(TrainerCallback):
                         else:
                             totals[5:] += torch.stack((terms[5], kl[0].double(), cosine[0].double(), terms.new_ones(()))).to(device)
                         observations.append({"step": step, "split": split, "dataset_index": chosen[split]["dataset_index"],
+                                             "position": PROBE_POSITIONS[split], "prediction_index": int(positions[offset][0]),
                                              "repr_kl": float(kl[0]), "cosine_distance": float(cosine[0])})
         finally:
             trainer._palu_diagnostic_mode = False
@@ -253,6 +264,7 @@ class PaluMonitor(TrainerCallback):
         sensitive, common, retain = totals[0] / f_count, totals[1] / f_count, totals[5] / r_count
         weighted = [trainer.gamma * sensitive, trainer.alpha * retain, trainer.alpha * common]
         row = {"step": step, "forget_count": f_count, "retain_count": r_count,
+               "forget_position": PROBE_POSITIONS["forget"], "retain_position": PROBE_POSITIONS["retain"],
                **dict(zip(LOSS_KEYS, [sum(weighted), *weighted, sensitive, retain, common])),
                "forget_repr_kl": totals[2] / f_count, "retain_repr_kl": totals[6] / r_count,
                "forget_cosine_distance": totals[3] / f_count, "retain_cosine_distance": totals[7] / r_count,

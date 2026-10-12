@@ -56,7 +56,12 @@ total = gamma * sensitive_forget_loss
 
 `plots/loss_vs_retain_kl.png` 和 PDF 为上下两个面板：上图四条固定样本损失，下图 Forget/Retain 两条表征 KL。上下图使用同一固定数据和同一次更新后的模型状态。固定样本损失先逐样本计算，再求均值；它与实际训练 batch 的聚合口径不同。
 
-提取预测答案首个 token 的 `h[a-1]`，位于最后 RMSNorm 后、`lm_head` 前。普通答案 token 的 `-200` 标签也算答案起点；不是首个敏感 token，也不是已经读入首个答案 token 后的 `h[a]`。诊断使用：
+表征均取最后 RMSNorm 后、`lm_head` 前，两个 split 的位置分别为：
+
+- **Forget**：预测整条答案中第一个敏感 token 的 `h[s-1]`。敏感标签为 `label >= 0` 且排除 EOS，跳过普通答案 token（`-200`）；只取最早敏感片段的第一个 token，不对多个片段取均值。该 token 也是 PALU 在 `FIRST_N >= 1` 或保留全部敏感 token 时的遗忘目标之一。
+- **Retain**：没有敏感片段标签，继续使用预测答案首 token 的 `h[a-1]`。
+
+当前模型与 Retain95 参考模型使用同一样本、同一位置和相同 teacher-forcing 前缀。Forget 表征能看到敏感 token 之前的普通答案内容，不能看到敏感 token 本身或其后文；不是读入该敏感 token 后的 `h[s]`。诊断使用：
 
 ```text
 KL(softmax(h_Retain95 / T) || softmax(h_current / T))
@@ -65,6 +70,8 @@ KL(softmax(h_Retain95 / T) || softmax(h_current / T))
 这是隐藏维度 softmax 后的诊断量，不是词表输出概率 KL，也不能单独证明知识删除或决定最佳训练步。历史文件同时保存余弦距离。上图 Common-token KL 是 Forget 数据中普通答案 token 相对于初始 Full 模型的输出约束，方向为 `KL(current || Full)`；与 Retain95 表征 KL 区分使用。
 
 Retain95 表征在训练前独立预计算并缓存，进程退出后才启动训练。训练诊断为 eval/no_grad，恢复 RNG 与模型状态；多卡各进程保持相同 forward 次数，填充样本不计入统计，只有主进程写历史。诊断不参与反向传播。
+
+没有有效敏感 token（包括截断后只剩 EOS）的 Forget 样本会跳过，原因写入 `reference_cache.json` 的 `skipped`；固定数量不足时明确报错，`all` 表示所有有效样本。新缓存使用 schema 2，按 split 保存位置定义；旧答案首 token 缓存不能复用。正常启动会在新输出目录自动生成新缓存，无需删除旧实验。`probe_history` 记录两组位置定义，`probe_samples` 还记录逐样本预测位置索引。历史曲线重绘仍按旧定义标注，不会把旧数值改称敏感位置 KL，也不允许新旧位置混合聚合。
 
 只保留四条训练曲线可设置 `DIAGNOSTICS=0`；纯性能测量使用 `DIAGNOSTICS=0 LOSS_HISTORY=0`。周期性诊断计入训练耗时，参考预计算单独计时。
 

@@ -1,5 +1,16 @@
 # PALU 单组诊断基线验证
 
+## 2026-10-13：Forget 探针改为首个敏感 token
+
+Forget 提取 `h[first_sensitive-1]`，Retain 保持 `h[first_answer-1]`。参考缓存升级为 schema 2，旧缓存明确拒绝；历史曲线仍按旧位置标注，新旧位置不能合并聚合。
+
+- 全部 36 项 CPU 回归测试通过，日志 `/private/tmp/palu-sensitive-probe-tests-20261013.log`。覆盖普通前缀跳过、多个敏感片段只取最早 token、padding/EOS、缺失敏感 token 跳过及数量不足报错、旧缓存和错误索引拒绝、当前/参考位置一致、敏感 token 及其后文不影响 `h[s-1]`。
+- 含随机 Retain 配对、dropout 和梯度累计的微型训练中，开启/关闭诊断后的最终参数逐位一致。
+- 双 CPU rank / Gloo 验证通过，日志 `/private/tmp/palu-sensitive-probe-gloo-20261013.log`。首次沙盒内运行被 OpenMP 共享内存限制中止，允许本机共享内存/通信后通过；没有改变模型实现来绕过测试。
+- 使用实际 `run_experiment.py`、独立 `prepare_diagnostics.py` 与训练入口，在 `artifacts/palu/local_validation_sensitive_probe_20261013/` 完成 seed 0 的 2 步微型 CPU 训练。缓存记录 Forget=`first_sensitive`、Retain=`first_answer`；step 0/1/2 的 KL/余弦与四条损失记录完整，PNG/PDF 输出及新图注已检查。参考使用同一微型初始模型，step 0 两组 KL 均为 0。
+
+该验证没有重跑 8B 模型，没有新的 FQ/MU 结果；CUDA/ZeRO-3 实际运行仍需服务器验证。以下为此前基线版本的历史验证。
+
 日期：2026-10-12。代码从原实验分支 `cca8424` 拆出，移除梯度切断与双组调度，保留官方均值梯度、训练记录和固定样本诊断。
 
 ## 本地回归测试

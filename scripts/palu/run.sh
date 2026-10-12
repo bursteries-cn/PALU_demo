@@ -35,7 +35,7 @@ MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29513}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 KEEP_MODEL="${KEEP_MODEL:-0}" # 0: remove final weights after successful evaluation of each seed.
 
-# Diagnostics: fixed samples shared across seeds; h[first answer - 1] before lm_head.
+# Diagnostics before lm_head: Forget h[first sensitive - 1], Retain h[first answer - 1].
 DIAGNOSTICS="${DIAGNOSTICS:-1}"
 LOSS_HISTORY="${LOSS_HISTORY:-1}"
 PROBE_EVERY="${PROBE_EVERY:-5}"

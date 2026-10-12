@@ -17,10 +17,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 from data import get_collators, get_data
 from model import get_tokenizer
-from trainer.palu_diagnostics import answer_prediction_positions, sha256_file, tokenizer_fingerprint
+from trainer.palu_diagnostics import (PROBE_CACHE_SCHEMA, PROBE_POSITIONS, probe_prediction_positions,
+                                      sha256_file, tokenizer_fingerprint)
 
 
-def fixed_samples(dataset, collator, count, seed, eos):
+def fixed_samples(dataset, collator, count, seed, eos, *, position):
     """Use independent RNG, and exactly the masks used by the training collator."""
     order = random.Random(seed).sample(range(len(dataset)), len(dataset))
     wanted = len(dataset) if count == -1 else min(count, len(dataset))
@@ -30,12 +31,12 @@ def fixed_samples(dataset, collator, count, seed, eos):
         batch = collator([actual])
         sample = {key: batch[key][0].cpu() for key in ("input_ids", "labels", "attention_mask")}
         try:
-            position = answer_prediction_positions(sample["labels"][None], sample["attention_mask"][None],
-                                                    sample["input_ids"][None], eos)
+            prediction = probe_prediction_positions(sample["labels"][None], sample["attention_mask"][None],
+                sample["input_ids"][None], eos, position=position)
         except ValueError as error:
             skipped.append({"dataset_index": index, "reason": str(error)})
             continue
-        selected.append({**sample, "dataset_index": index, "prediction_index": int(position[0])})
+        selected.append({**sample, "dataset_index": index, "prediction_index": int(prediction[0])})
         if len(selected) == wanted:
             break
     if not selected:
@@ -79,7 +80,8 @@ def prepare(request):
     samples, skipped = {}, {}
     for split, offset in (("forget", 0), ("retain", 1)):
         samples[split], skipped[split] = fixed_samples(getattr(datasets, split), collator,
-            request[f"{split}_samples"], request["probe_seed"] + offset, tokenizer.eos_token_id)
+            request[f"{split}_samples"], request["probe_seed"] + offset, tokenizer.eos_token_id,
+            position=PROBE_POSITIONS[split])
 
     local_hashes = {}
     if Path(teacher_path).is_dir():
@@ -109,8 +111,10 @@ def prepare(request):
                     print(f"Reference {split}: {index + 1}/{len(samples[split])}", flush=True)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    metadata = {"schema": 1, "position": "predict_first_answer", "layer": "final RMSNorm output before lm_head",
-        "input_scope": "same teacher-forced training sequence; causal h[a-1] cannot attend answer tokens",
+    metadata = {"schema": PROBE_CACHE_SCHEMA, "positions": PROBE_POSITIONS,
+        "layer": "final RMSNorm output before lm_head",
+        "input_scope": "same teacher-forced training sequence; causal h[t-1] sees only tokens before the target, "
+                       "including the ordinary answer prefix before the first sensitive token on Forget",
         "tokenizer_sha256": tokenizer_fingerprint(tokenizer),
         "architecture": {key: getattr(teacher.config, key) for key in keys},
         "retain_model_path": teacher_path, "requested_revision": requested_revision,

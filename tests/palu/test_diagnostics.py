@@ -18,10 +18,10 @@ sys.path[:0] = [str(ROOT / "src"), str(ROOT / "scripts/palu")]
 from data.collators import DataCollatorForSupervisedDataset
 from data.unlearn import ForgetRetainDataset
 from trainer.unlearn.palu import PALU
-from trainer.palu_diagnostics import (answer_prediction_positions, capture_pre_head, preserve_rng_and_modes,
-    representation_distances, sha256_file, tokenizer_fingerprint)
+from trainer.palu_diagnostics import (PROBE_CACHE_SCHEMA, PROBE_POSITIONS, probe_prediction_positions,
+    capture_pre_head, preserve_rng_and_modes, representation_distances, sha256_file, tokenizer_fingerprint)
 from prepare_diagnostics import fixed_samples
-from plot_history import LOSSES, aggregate, mean_interval, read_history, render
+from plot_history import LOSSES, aggregate, mean_interval, probe_position_caption, read_history, render
 from run_experiment import build_commands, write_json
 from test_experiment_protocol import settings, compose_training
 
@@ -46,13 +46,14 @@ def cache_fixture(path, model, tokenizer, dataset, collator):
     teacher = copy.deepcopy(model).eval()
     samples = {}
     for split, count in (("forget", 3), ("retain", 2)):
-        samples[split], _ = fixed_samples(getattr(dataset, split), collator, count, 42, tokenizer.eos_token_id)
+        samples[split], _ = fixed_samples(getattr(dataset, split), collator, count, 42, tokenizer.eos_token_id,
+                                         position=PROBE_POSITIONS[split])
         with torch.no_grad():
             for sample in samples[split]:
                 hidden = teacher.model(input_ids=sample["input_ids"][None],
                     attention_mask=sample["attention_mask"][None], use_cache=False).last_hidden_state
                 sample["reference_hidden"] = hidden[0, sample["prediction_index"]].clone()
-    torch.save({"metadata": {"schema": 1, "position": "predict_first_answer",
+    torch.save({"metadata": {"schema": PROBE_CACHE_SCHEMA, "positions": PROBE_POSITIONS,
         "tokenizer_sha256": tokenizer_fingerprint(tokenizer),
         "architecture": {key: getattr(model.config, key) for key in ("model_type", "hidden_size", "vocab_size")}},
         "samples": samples}, path)
@@ -64,11 +65,35 @@ class DiagnosticTests(unittest.TestCase):
         labels = torch.tensor([[-100, -100, -200, 4, -100], [-100, -100, -100, -200, 4]])
         mask = torch.tensor([[1, 1, 1, 1, 0], [0, 1, 1, 1, 1]])
         ids = torch.tensor([[1, 3, 4, 5, 0], [0, 1, 3, 4, 5]])
-        self.assertEqual(answer_prediction_positions(labels, mask, ids).tolist(), [1, 2])
+        self.assertEqual(probe_prediction_positions(labels, mask, ids, position="first_answer").tolist(), [1, 2])
         with self.assertRaisesRegex(ValueError, "No answer"):
-            answer_prediction_positions(labels.fill_(-100), mask, ids)
-        with self.assertRaisesRegex(ValueError, "preceding prompt"):
-            answer_prediction_positions(torch.tensor([[4, 5]]), torch.ones(1, 2), torch.tensor([[4, 5]]))
+            probe_prediction_positions(labels.fill_(-100), mask, ids, position="first_answer")
+        with self.assertRaisesRegex(ValueError, "preceding context"):
+            probe_prediction_positions(torch.tensor([[4, 5]]), torch.ones(1, 2), torch.tensor([[4, 5]]),
+                                       position="first_answer")
+
+    def test_first_sensitive_skips_common_tokens_and_later_spans_with_padding(self):
+        labels = torch.tensor([[-100, -200, 5, 6, -200, 7, 2], [-100, -100, -200, -200, 8, 9, 2]])
+        mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1], [0, 1, 1, 1, 1, 1, 1]])
+        ids = torch.tensor([[1, 3, 5, 6, 4, 7, 2], [0, 1, 3, 4, 8, 9, 2]])
+        self.assertEqual(probe_prediction_positions(labels, mask, ids, 2, position="first_sensitive").tolist(), [1, 3])
+        # EOS alone and sensitive labels hidden by the attention mask are not targets.
+        for labels, mask, ids in (([[-100, -200, 2]], [[1, 1, 1]], [[1, 3, 2]]),
+                                 ([[-100, -200, 5]], [[1, 1, 0]], [[1, 3, 5]])):
+            with self.assertRaisesRegex(ValueError, "No sensitive"):
+                probe_prediction_positions(torch.tensor(labels), torch.tensor(mask), torch.tensor(ids), 2,
+                                           position="first_sensitive")
+
+    def test_fixed_forget_samples_skip_missing_sensitive_tokens_without_fallback(self):
+        _, tokenizer, dataset, collator = fixture()
+        dataset.forget[0]["labels"] = torch.tensor([-100, -200, -200, -200, 2])
+        selected, skipped = fixed_samples(dataset.forget, collator, -1, 42, tokenizer.eos_token_id,
+                                         position="first_sensitive")
+        self.assertEqual({row["dataset_index"] for row in selected}, {1, 2, 3})
+        self.assertEqual(skipped, [{"dataset_index": 0, "reason": "No sensitive token remains after masking/truncation"}])
+        self.assertTrue(all(row["prediction_index"] == 1 for row in selected))
+        with self.assertRaisesRegex(ValueError, "Requested 4 valid diagnostic examples, found 3"):
+            fixed_samples(dataset.forget, collator, 4, 42, tokenizer.eos_token_id, position="first_sensitive")
 
     def test_kl_direction_feature_sum_and_temperature(self):
         ref, cur = torch.tensor([[0., 2., -2.], [1., 0., .5]]), torch.tensor([[-2., .5, 2.], [.4, -.3, .2]])
@@ -84,12 +109,18 @@ class DiagnosticTests(unittest.TestCase):
         model, _, dataset, collator = fixture()
         model.eval()
         batch = collator([dataset.forget[0]])
-        position = answer_prediction_positions(batch["labels"], batch["attention_mask"], batch["input_ids"])
+        position = probe_prediction_positions(batch["labels"], batch["attention_mask"], batch["input_ids"],
+                                              position="first_sensitive")
         with torch.no_grad(), capture_pre_head(model, [position]) as captured:
             model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False)
-        expected = model.model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False).last_hidden_state[:, 0]
+        expected = model.model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False).last_hidden_state[:, 1]
         torch.testing.assert_close(captured[0], expected)
         self.assertFalse(captured[0].requires_grad)
+        changed = batch["input_ids"].clone()
+        changed[:, 2:] = 10  # Changing the sensitive token and its suffix cannot affect h[s-1].
+        with torch.no_grad(), capture_pre_head(model, [position]) as after:
+            model(input_ids=changed, attention_mask=batch["attention_mask"], use_cache=False)
+        torch.testing.assert_close(after[0], captured[0])
 
     def test_probe_preserves_rng_and_each_module_mode(self):
         module = torch.nn.Sequential(torch.nn.Dropout(), torch.nn.Dropout())
@@ -135,8 +166,12 @@ class DiagnosticTests(unittest.TestCase):
                     self.assertEqual(list(probes), [0, 2, 3])
                     self.assertTrue(all(row["forget_count"] == 3 and row["retain_count"] == 2 for row in probes.values()))
                     self.assertAlmostEqual(probes[0]["forget_repr_kl"], 0., places=6)
-                    records = (root / str(enabled) / "probe_samples.jsonl").read_text().splitlines()
+                    self.assertTrue(all(row["forget_position"] == "first_sensitive" and
+                                        row["retain_position"] == "first_answer" for row in probes.values()))
+                    records = [json.loads(line) for line in (root / str(enabled) / "probe_samples.jsonl").read_text().splitlines()]
                     self.assertEqual(len(records), 15)
+                    self.assertTrue(all(row["prediction_index"] == (1 if row["split"] == "forget" else 0)
+                                        for row in records))
                     self.assertTrue(all(row["included_in_trainer_runtime"] for row in probes.values()))
                 self.assertTrue(all(parameter.grad is None for parameter in trainer.ref_model.parameters()))
             self.assertTrue(all(torch.equal(value, states[1][key]) for key, value in states[0].items()))
@@ -154,8 +189,36 @@ class DiagnosticTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cache hash"):
                 trainer.train()
 
+    def test_old_answer_cache_and_wrong_prediction_index_are_rejected(self):
+        for stale_schema in (True, False):
+            with self.subTest(stale_schema=stale_schema), tempfile.TemporaryDirectory() as temporary:
+                initial, tokenizer, dataset, collator = fixture()
+                root = Path(temporary)
+                options = cache_fixture(root / "reference.pt", initial, tokenizer, dataset, collator)
+                cache = torch.load(root / "reference.pt", weights_only=True)
+                if stale_schema:
+                    cache["metadata"].update(schema=1, position="predict_first_answer")
+                    cache["metadata"].pop("positions")
+                else:
+                    cache["samples"]["forget"][0]["prediction_index"] = 0
+                torch.save(cache, root / "reference.pt")
+                options["cache_sha256"] = sha256_file(root / "reference.pt")
+                trainer = PALU(model=initial, tokenizer=tokenizer, train_dataset=dataset, data_collator=collator,
+                    args=TrainingArguments(output_dir=str(root / "run"), use_cpu=True, max_steps=1, report_to=[],
+                        remove_unused_columns=False, disable_tqdm=True), diagnostics=options)
+                with self.assertRaisesRegex(ValueError, "outdated schema" if stale_schema else "prediction position differs"):
+                    trainer.train()
+
 
 class PlotTests(unittest.TestCase):
+    def test_old_plots_keep_answer_labels_and_mixed_positions_are_rejected(self):
+        old = {0: {0: {"step": 0}}}
+        new = {0: {0: {"step": 0, "forget_position": "first_sensitive", "retain_position": "first_answer"}}}
+        self.assertIn("Forget: h[first answer token - 1]", probe_position_caption(old))
+        self.assertIn("Forget: h[first sensitive token - 1]", probe_position_caption(new))
+        with self.assertRaisesRegex(ValueError, "different diagnostic token positions"):
+            probe_position_caption({0: old[0], 1: new[0]})
+
     def test_student_t_interval_and_no_invented_single_seed_ci(self):
         interval = mean_interval([1., 2., 3.])
         self.assertAlmostEqual(interval["mean"], 2.)
@@ -180,6 +243,7 @@ class PlotTests(unittest.TestCase):
                 runs.append({"seed": seed, "output_dir": str(run)})
                 rows = [{"step": step, "loss_total": 2 + seed * .1,
                     "loss_forget": 1 + seed * .1, "loss_retain_nll": .7, "loss_common_kl": .3,
+                    "forget_position": "first_sensitive", "retain_position": "first_answer",
                     "forget_repr_kl": .5 + seed * .1, "retain_repr_kl": .2} for step in (1, 2)]
                 text = "".join(json.dumps(row) + "\n" for row in rows)
                 (run / "loss_history.jsonl").write_text(text)
@@ -188,6 +252,7 @@ class PlotTests(unittest.TestCase):
             output = render(root)
             for name in ("loss_curves.png", "loss_curves.pdf", "loss_vs_retain_kl.png", "loss_vs_retain_kl.pdf", "curve_statistics.csv"):
                 self.assertGreater((output / name).stat().st_size, 100)
+            self.assertIn("Forget: h[first sensitive token - 1]", (output / "README.txt").read_text())
 
 
 class LauncherTests(unittest.TestCase):

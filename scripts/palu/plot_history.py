@@ -118,6 +118,25 @@ def trend_intervals(histories, seeds):
     return rows
 
 
+def probe_position_caption(histories):
+    """Preserve old answer-position labels and reject incompatible probe histories."""
+    definitions = set()
+    for history in histories.values():
+        for row in history.values():
+            # Histories before cache schema 2 probed the first answer on both splits.
+            if "forget_position" not in row and "retain_position" not in row:
+                definitions.add(("first_answer", "first_answer"))
+            else:
+                definitions.add((row.get("forget_position"), row.get("retain_position")))
+    if len(definitions) != 1:
+        raise ValueError("Cannot combine different diagnostic token positions")
+    forget, retain = definitions.pop()
+    names = {"first_sensitive": "first sensitive token", "first_answer": "first answer token"}
+    if forget not in names or retain != "first_answer":
+        raise ValueError("Unknown diagnostic token positions in probe history")
+    return f"Forget: h[{names[forget]} - 1]; Retain: h[{names[retain]} - 1]"
+
+
 def render(root):
     root = Path(root)
     manifest = json.loads((root / "manifest.json").read_text())
@@ -133,6 +152,7 @@ def render(root):
     probe_rows = aggregate(probes, seeds, "fixed_probe", LOSSES + KLS)
     if not train_rows and not probe_rows:
         return None
+    position_caption = probe_position_caption(probes) if probe_rows else ""
     output = root / "plots"
     output.mkdir(exist_ok=True)
     write_csv(output / "curve_statistics.csv", train_rows + probe_rows)
@@ -152,7 +172,7 @@ def render(root):
         fig, axes = plt.subplots(2, 1, figsize=(9, 9), sharex=True)
         draw(axes[0], probe_rows, LOSSES, "Fixed-probe loss (per-example mean)")
         draw(axes[1], probe_rows, KLS, "Pre-head representation KL (nats)")
-        fig.suptitle("Same fixed training examples and post-update state | h[first answer - 1]", fontsize=12)
+        fig.suptitle("Same fixed training examples and post-update state\n" + position_caption, fontsize=11)
         fig.text(.5, .015, footnote, ha="center", fontsize=8)
         fig.tight_layout(rect=(0, .07, 1, .96))
         for extension in ("png", "pdf"):
@@ -161,6 +181,7 @@ def render(root):
     (output / "README.txt").write_text(footnote + "\nWeighted NLL is measured on Retain training examples.\n"
         "Weighted common-token KL is on Forget examples against the initial Full reference.\n"
         "Representation KL compares softmax(hidden/T) against a separate Retain-only reference.\n"
+        + (position_caption + "\n" if position_caption else "") +
         "Fixed-probe losses are per-example means; training losses average actual microbatch objectives.\n"
         "trend_intervals.csv marks exploratory opposite-direction intervals, not significant change points.\n", encoding="utf-8")
     return output
