@@ -166,6 +166,33 @@ def full_eval_commands(args, paths):
     return commands
 
 
+def execute_full_eval(command, log_path, name, index, total):
+    """Tee evaluation output so the launch log remains a live progress view."""
+    print(f"[full_eval {index}/{total}] Starting {name}; log={log_path}", flush=True)
+    started = time.perf_counter()
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(command, cwd=ROOT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"}, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1)
+        try:
+            for line in process.stdout:
+                log.write(line)
+                log.flush()
+                print(line, end="", flush=True)
+            returncode = process.wait()
+        finally:
+            process.stdout.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait()
+    if returncode:
+        print(f"[full_eval {index}/{total}] Failed {name}, exit={returncode}; log={log_path}", flush=True)
+        raise subprocess.CalledProcessError(returncode, command)
+    elapsed = time.perf_counter() - started
+    print(f"[full_eval {index}/{total}] Completed {name} in {elapsed:.1f}s", flush=True)
+    return elapsed
+
+
 def run(args, manifest):
     import torch
     import transformers
@@ -257,16 +284,19 @@ def run(args, manifest):
         reference = json.loads(args.retain_logs.read_text())
         scores = lambda log: [x["score"] for x in log["forget_truth_ratio"]["value_by_index"].values()]
         manifest["retain_logs_sha256"] = sha256(args.retain_logs)
-        for name, command in commands.items():
+        for index, (name, command) in enumerate(commands.items(), start=1):
             begin = time.perf_counter()
-            with (args.output / f"full_eval_{name}.log").open("w") as log:
-                subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
+            manifest["full_eval_progress"] = {"current": name, "index": index, "total": len(commands),
+                                               "completed": list(summary)}
+            write_json(args.output / "manifest.json", manifest)
+            execute_full_eval(command, args.output / f"full_eval_{name}.log", name, index, len(commands))
             directory = args.output / "full_eval" / name
             summary[name] = json.loads((directory / "TOFU_SUMMARY.json").read_text())
             raw = json.loads((directory / "TOFU_EVAL.json").read_text())
             summary[name]["forget_ks_statistic"] = float(ks_2samp(scores(raw), scores(reference)).statistic)
             summary[name]["eval_wall_seconds"] = time.perf_counter() - begin
             write_json(args.output / "full_eval_summary.json", summary)
+        manifest["full_eval_progress"] = {"current": None, "total": len(commands), "completed": list(summary)}
     manifest.update(status="completed", soup_total_wall_seconds=time.perf_counter() - started)
     write_json(args.output / "manifest.json", manifest)
 
