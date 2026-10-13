@@ -1,5 +1,7 @@
 # PALU 后续实验基线
 
+训练后的 EfficientSoup 实验入口见 [EFFICIENT_SOUP.md](EFFICIENT_SOUP.md)，可保留两个 PALU seed 后进行两阶段权重插值搜索与对照评估。
+
 分支 `experiment/palu-diagnostics-baseline` 从原对比分支的 `cca8424` 建立。训练固定采用官方全词表均值的完整梯度，每个 seed 只训练一次。原实验代码及双组汇总在 `experiment/palu-mean-gradient-ablation` 分支保留。
 
 ## 一键启动与参数
