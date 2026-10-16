@@ -7,6 +7,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import pickle
 import random
 import sys
 import tempfile
@@ -230,6 +231,152 @@ class ResultAuditTests(unittest.TestCase):
             self.collect()
 
 
+class ResumeFromForkTests(unittest.TestCase):
+    """Exercise recovery metadata and filesystem mutations with tiny fixtures."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        base = Path(temporary.name).resolve()
+        self.study, self.code_root = base / "study", base / "current_code"
+        self.study.mkdir()
+        self.provenance = {"fixture": "same-seed103-source"}
+        self.write_json("experiment.json", {
+            "experiment": "seed103_four_gpu_global_token_step6_branches",
+            "source_provenance": self.provenance})
+        frozen = self.study / "frozen"
+        frozen.mkdir()
+        names = ("config.json", "schedule.pt", "retain_reference.json", "epoch_schedule.json", "pair_schedule.jsonl")
+        for name in names:
+            (frozen / name).write_bytes(("unchanged fixture " + name).encode())
+        self.frozen_hashes = {name: replay.sha(frozen / name) for name in names}
+        self.write_json("frozen/manifest.json", {
+            "seed103_source_provenance": self.provenance, "frozen_file_sha256": self.frozen_hashes})
+        self.fork = {"status": "ready", "fork_step": 6, "consumed_pairs": 192, "world_size": 4,
+            "config_sha256": self.frozen_hashes["config.json"],
+            "schedule_sha256": self.frozen_hashes["schedule.pt"],
+            "initial_parameter_sha256": "same-initial", "teacher_parameter_sha256": "same-initial"}
+        self.write_json("fork/receipt.json", self.fork)
+        self.fork_sha = replay.sha(self.study / "fork/receipt.json")
+        self.prefix = {**self.fork, "status": "prefix_completed", "completed_updates": 6,
+                       "pending_pairs": 0, "fork_receipt_sha256": self.fork_sha}
+        self.write_json("prefix/manifest.json", self.prefix)
+        self.prefix_sha = replay.sha(self.study / "prefix/manifest.json")
+        self.code_names = sorted(experiment.COMPATIBILITY_PATCH_FILES) + ["src/trainer/unlearn/palu.py"]
+        self.old_bytes = {name: ("old fixture " + name).encode() for name in self.code_names}
+        old_hashes = {}
+        for name in self.code_names:
+            current = self.code_root / name
+            snapshot = self.study / "code_snapshot" / name
+            current.parent.mkdir(parents=True, exist_ok=True)
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            snapshot.write_bytes(self.old_bytes[name])
+            old_hashes[name] = replay.sha(snapshot)
+            current.write_bytes(("compatibility patch " + name).encode()
+                                if name in experiment.COMPATIBILITY_PATCH_FILES else self.old_bytes[name])
+        self.old_hashes = old_hashes
+        self.write_json("code_sha256.json", old_hashes)
+        self.failed = {**self.fork, "status": "training", "completed_updates": 0}
+        self.write_json("continue/manifest.json", self.failed)
+        self.write_json("continue/resolved_config.json", {"fixture": "failed initialization config"})
+        self.failed_manifest_bytes = (self.study / "continue/manifest.json").read_bytes()
+        self.failed_config_bytes = (self.study / "continue/resolved_config.json").read_bytes()
+        (self.study / "logs").mkdir()
+        self.failed_logs = {}
+        for suffix in ("train", "disk_before", "gpu_before"):
+            name = f"continue_{suffix}.log"
+            content = ("original failed-load evidence " + suffix).encode()
+            (self.study / "logs" / name).write_bytes(content)
+            self.failed_logs[name] = content
+
+    def write_json(self, relative, value):
+        path = self.study / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        experiment.write_json(path, value)
+
+    def resume(self, fork_error=None):
+        with patch.object(experiment, "ROOT", self.code_root), \
+                patch.object(experiment, "code_paths", return_value=[self.code_root / name for name in self.code_names]), \
+                patch.object(experiment.source, "validate_assets", return_value=(None, None, None, self.provenance)), \
+                patch.object(experiment, "validate_fork_receipt", return_value=self.fork, side_effect=fork_error) as validator, \
+                patch("builtins.print"):
+            result = experiment.resume_from_fork(SimpleNamespace(study=self.study, assets=Path("fixture-assets")))
+            validator.assert_called_once_with(self.study, require_tensors=True)
+            return result
+
+    def assert_not_mutated(self):
+        self.assertTrue((self.study / "continue/manifest.json").is_file())
+        self.assertFalse((self.study / "compatibility_audit").exists())
+        self.assertFalse((self.study / "failed_load_attempts").exists())
+        self.assertEqual(replay.read_json(self.study / "code_sha256.json"), self.old_hashes)
+
+    def test_only_compatibility_sources_refresh_and_failed_attempt_is_preserved(self):
+        receipt = self.resume()
+        self.assertEqual(receipt["status"], "ready_to_resume_from_fork")
+        self.assertEqual(set(receipt["changed_files"]), experiment.COMPATIBILITY_PATCH_FILES)
+        self.assertEqual(receipt["branch_states_before"], {
+            "continue": "failed_initialization_only", "repair": "new", "weak": "new"})
+        self.assertFalse((self.study / "continue").exists())
+        archived = self.study / receipt["quarantined_attempts"][0]
+        self.assertEqual((archived / "manifest.json").read_bytes(), self.failed_manifest_bytes)
+        self.assertEqual((archived / "resolved_config.json").read_bytes(), self.failed_config_bytes)
+        for name, content in self.failed_logs.items():
+            self.assertEqual((archived / "logs" / name).read_bytes(), content)
+            self.assertEqual((self.study / "logs" / name).read_bytes(), content)
+        audit, = (self.study / "compatibility_audit").iterdir()
+        self.assertEqual(replay.read_json(audit / "previous_code_sha256.json"), self.old_hashes)
+        for name in self.code_names:
+            self.assertEqual((audit / "previous_code_snapshot" / name).read_bytes(), self.old_bytes[name])
+            self.assertEqual((self.study / "code_snapshot" / name).read_bytes(), (self.code_root / name).read_bytes())
+        self.assertEqual(replay.sha(self.study / "fork/receipt.json"), self.fork_sha)
+        self.assertEqual(replay.sha(self.study / "prefix/manifest.json"), self.prefix_sha)
+        self.assertEqual({name: replay.sha(self.study / "frozen" / name) for name in self.frozen_hashes}, self.frozen_hashes)
+
+    def test_modified_frozen_input_is_rejected_before_any_mutation(self):
+        (self.study / "frozen/schedule.pt").write_bytes(b"changed sample schedule")
+        with self.assertRaisesRegex(ValueError, "Frozen scientific input"):
+            self.resume()
+        self.assert_not_mutated()
+
+    def test_scientific_source_change_is_rejected_before_any_mutation(self):
+        (self.code_root / "src/trainer/unlearn/palu.py").write_bytes(b"changed scientific objective")
+        with self.assertRaisesRegex(ValueError, "outside the compatibility patch"):
+            self.resume()
+        self.assert_not_mutated()
+
+    def test_modified_old_snapshot_is_rejected_before_any_mutation(self):
+        (self.study / "code_snapshot/scripts/palu/seed103_branch_training.py").write_bytes(b"altered evidence")
+        with self.assertRaisesRegex(ValueError, "Original code snapshot changed"):
+            self.resume()
+        self.assert_not_mutated()
+
+    def test_any_restored_or_trained_suffix_is_preserved_and_rejected(self):
+        for filename in ("fork_restore_receipt.json", "loss_history.jsonl"):
+            with self.subTest(file=filename):
+                path = self.study / "continue" / filename
+                path.write_text("{}\n")
+                with self.assertRaisesRegex(ValueError, "restored/partial training results"):
+                    self.resume()
+                self.assert_not_mutated()
+                path.unlink()
+        self.write_json("continue/manifest.json", {**self.failed, "completed_updates": 1})
+        with self.assertRaisesRegex(ValueError, "restored/partial training results"):
+            self.resume()
+        self.assert_not_mutated()
+
+    def test_only_complete_six_update_prefix_and_full_restart_can_resume(self):
+        for key, invalid in (("completed_updates", 5), ("consumed_pairs", 200), ("pending_pairs", 8)):
+            with self.subTest(field=key):
+                self.write_json("prefix/manifest.json", {**self.prefix, key: invalid})
+                with self.assertRaisesRegex(ValueError, "six-update, 192-pair prefix"):
+                    self.resume()
+                self.assert_not_mutated()
+        self.write_json("prefix/manifest.json", self.prefix)
+        with self.assertRaisesRegex(ValueError, "missing fork tensor"):
+            self.resume(fork_error=ValueError("missing fork tensor"))
+        self.assert_not_mutated()
+
+
 def tiny_runtime(torch):
     """Ordinary CPU Adam, deliberately not a stand-in for native ZeRO restore."""
     model = torch.nn.Sequential(torch.nn.Linear(3, 4), torch.nn.Tanh(), torch.nn.Linear(4, 2)).double()
@@ -323,6 +470,101 @@ class TinyStateTests(unittest.TestCase):
             self.assertFalse(torch.equal(endpoints["continue"], endpoints["repair"]))
             self.assertFalse(torch.equal(endpoints["repair"], endpoints["weak"]))
             self.assertFalse(torch.equal(endpoints["continue"], endpoints["weak"]))
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch") and importlib.util.find_spec("deepspeed"),
+                     "Native TorchCheckpointEngine is installed in the server PALU environment")
+class NativeCheckpointLoaderTests(unittest.TestCase):
+    """Use the installed DS loader and enum; no ZeRO engine or GPU is created."""
+
+    def setUp(self):
+        import torch
+        from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchCheckpointEngine
+        from deepspeed.runtime.zero.config import ZeroStageEnum
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.study = Path(temporary.name).resolve()
+        self.folder = self.study / "fork_weights"
+        (self.folder / "step6").mkdir(parents=True)
+        self.payload = {"zero_stage": ZeroStageEnum.weights, "moment": torch.tensor([1.0, 2.0])}
+        self.receipt = {"status": "ready", "tag": "step6", "fork_step": 6, "consumed_pairs": 192,
+                        "world_size": 4, "rank_fingerprints": [{} for _ in range(4)], "files": {}}
+        for rank in range(4):
+            for name in (f"step6/zero_pp_rank_{rank}_mp_rank_00_optim_states.pt", f"rank-{rank}.pt"):
+                target = self.folder / name
+                torch.save(self.payload, target)
+                self.receipt["files"][name] = {"bytes": target.stat().st_size, "sha256": replay.sha(target)}
+        self.path = self.folder / "step6/zero_pp_rank_0_mp_rank_00_optim_states.pt"
+        self.loader = TorchCheckpointEngine()
+        self.runtime = {"engine": SimpleNamespace(checkpoint_engine=self.loader)}
+        self.assertEqual(branches.validate_fork_files(self.study, self.receipt), self.folder.resolve())
+
+    def test_real_native_enum_fails_by_default_and_only_owned_loader_is_relaxed(self):
+        import torch
+        from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchCheckpointEngine
+        from deepspeed.runtime.zero.config import ZeroStageEnum
+        original = self.loader.load
+        class_method = TorchCheckpointEngine.load
+        torch_loader = torch.load
+        with self.assertRaisesRegex(pickle.UnpicklingError, "ZeroStageEnum"):
+            self.loader.load(str(self.path), map_location="cpu")
+        with branches.trusted_native_checkpoint_loading(self.runtime, self.receipt, self.folder, torch):
+            restored = self.loader.load(str(self.path), map_location="cpu")
+            self.assertEqual(restored["zero_stage"], ZeroStageEnum.weights)
+            torch.testing.assert_close(restored["moment"], self.payload["moment"])
+            self.assertIs(TorchCheckpointEngine.load, class_method)
+            self.assertIs(torch.load, torch_loader)
+            with self.assertRaisesRegex(pickle.UnpicklingError, "ZeroStageEnum"):
+                TorchCheckpointEngine().load(str(self.path), map_location="cpu")
+            with self.assertRaisesRegex(pickle.UnpicklingError, "ZeroStageEnum"):
+                torch.load(self.path, map_location="cpu")
+        self.assertEqual(self.loader.load, original)
+        with self.assertRaisesRegex(pickle.UnpicklingError, "ZeroStageEnum"):
+            self.loader.load(str(self.path), map_location="cpu")
+
+    def test_exception_exit_restores_the_original_loader(self):
+        import torch
+        original = self.loader.load
+        with self.assertRaisesRegex(RuntimeError, "synthetic restore interruption"):
+            with branches.trusted_native_checkpoint_loading(self.runtime, self.receipt, self.folder, torch):
+                self.loader.load(str(self.path), map_location="cpu")
+                raise RuntimeError("synthetic restore interruption")
+        self.assertEqual(self.loader.load, original)
+        with self.assertRaisesRegex(pickle.UnpicklingError, "ZeroStageEnum"):
+            self.loader.load(str(self.path), map_location="cpu")
+
+    def test_unlisted_path_and_changed_file_are_rejected_before_unpickling(self):
+        import torch
+        unlisted = self.folder / "step6/unlisted_model_states.pt"
+        torch.save(self.payload, unlisted)
+        outside = self.study / "outside_optim_states.pt"
+        torch.save(self.payload, outside)
+        for target in (unlisted, outside):
+            with self.subTest(target=target.name), self.assertRaises((ValueError, RuntimeError, OSError)):
+                with branches.trusted_native_checkpoint_loading(self.runtime, self.receipt, self.folder, torch):
+                    self.loader.load(str(target), map_location="cpu")
+        # A valid native payload with new tensor contents must fail its receipt
+        # hash rather than being accepted because the filename is registered.
+        torch.save({**self.payload, "moment": torch.tensor([3.0, 4.0])}, self.path)
+        with self.assertRaises((ValueError, RuntimeError, OSError)):
+            with branches.trusted_native_checkpoint_loading(self.runtime, self.receipt, self.folder, torch):
+                self.loader.load(str(self.path), map_location="cpu")
+
+    def test_direct_symlink_and_symlink_parent_are_rejected(self):
+        import torch
+        direct = self.folder / "step6/symlink_optim_states.pt"
+        direct.symlink_to(self.path)
+        linked_directory = self.folder / "linked_step6"
+        linked_directory.symlink_to(self.folder / "step6", target_is_directory=True)
+        self.receipt["files"][str(direct.relative_to(self.folder))] = copy.deepcopy(
+            self.receipt["files"][str(self.path.relative_to(self.folder))])
+        nested = linked_directory / self.path.name
+        self.receipt["files"][str(nested.relative_to(self.folder))] = copy.deepcopy(
+            self.receipt["files"][str(self.path.relative_to(self.folder))])
+        for target in (direct, nested):
+            with self.subTest(target=str(target)), self.assertRaises((ValueError, RuntimeError, OSError)):
+                with branches.trusted_native_checkpoint_loading(self.runtime, self.receipt, self.folder, torch):
+                    self.loader.load(str(target), map_location="cpu")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ The parent loop remains shared with the existing online-epoch experiment.
 A native ZeRO checkpoint is temporary; each branch loads it in a fresh process.
 """
 import argparse
+from contextlib import contextmanager
 import copy
 import hashlib
 import json
@@ -123,6 +124,64 @@ def validate_fork_files(study, receipt):
     return folder
 
 
+@contextmanager
+def trusted_native_checkpoint_loading(runtime, receipt, folder, torch):
+    """Read only this run's verified native DS files with full deserialization.
+
+    DS 0.15 does not specify torch.load(weights_only=...), whereas PyTorch 2.6+
+    defaults to weights_only=True. Native optimizer state includes DS enums and
+    cannot use that restricted tensor-only reader. Override just this student's
+    checkpoint reader for the duration of its native restore, never torch.load.
+    """
+    folder = Path(folder)
+    if folder.is_symlink():
+        raise ValueError("Native fork folder cannot be a symlink")
+    root = folder.resolve()
+    allowed = {}
+    for name, item in receipt["files"].items():
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("Invalid native fork inventory path")
+        if (relative.parent == Path(receipt["tag"]) and
+                relative.name.endswith(("_model_states.pt", "_optim_states.pt"))):
+            allowed[root / relative] = item
+    if not allowed:
+        raise ValueError("No inventoried native DeepSpeed checkpoint files")
+    checkpoint_engine = runtime["engine"].checkpoint_engine
+    own_attribute = "load" in vars(checkpoint_engine)
+    original = checkpoint_engine.load
+
+    def load_owned_native(path, map_location=None):
+        target = Path(path).absolute()
+        if (target not in allowed or target.is_symlink() or
+                not target.resolve().is_relative_to(root) or
+                any(parent.is_symlink() for parent in target.parents
+                    if parent.is_relative_to(root))):
+            raise ValueError("Native checkpoint load is outside the verified fork inventory")
+        expected = allowed[target]
+        # Hash and deserialize the same open file; changing or substituting a
+        # native checkpoint after the earlier global inventory check must fail.
+        with target.open("rb") as handle:
+            if os.fstat(handle.fileno()).st_size != expected["bytes"]:
+                raise ValueError("Native checkpoint changed since fork validation")
+            digest = hashlib.sha256()
+            for block in iter(lambda: handle.read(8 << 20), b""):
+                digest.update(block)
+            if digest.hexdigest() != expected["sha256"]:
+                raise ValueError("Native checkpoint changed since fork validation")
+            handle.seek(0)
+            return torch.load(handle, map_location=map_location, weights_only=False)
+
+    checkpoint_engine.load = load_owned_native
+    try:
+        yield
+    finally:
+        if own_attribute:
+            checkpoint_engine.load = original
+        else:
+            del checkpoint_engine.load
+
+
 def save_fork(study, runtime, manifest, torch):
     rank, engine = runtime["rank"], runtime["engine"]
     if int(engine.global_steps) != FORK_STEP or int(engine.micro_steps) != FORK_STEP * 8:
@@ -181,8 +240,9 @@ def load_fork(study, runtime, manifest, arm, torch):
     torch.distributed.broadcast_object_list(errors, src=0)
     if errors[0]:
         raise ValueError(errors[0])
-    path, client = runtime["engine"].load_checkpoint(str(Path(study) / "fork_weights"), tag=receipt["tag"],
-        load_module_strict=True, load_optimizer_states=True, load_lr_scheduler_states=True, load_module_only=False)
+    with trusted_native_checkpoint_loading(runtime, receipt, Path(study) / "fork_weights", torch):
+        path, client = runtime["engine"].load_checkpoint(str(Path(study) / "fork_weights"), tag=receipt["tag"],
+            load_module_strict=True, load_optimizer_states=True, load_lr_scheduler_states=True, load_module_only=False)
     if not path or any(client.get(key) != receipt[key] for key in
             ("fork_step", "consumed_pairs", "schedule_sha256", "config_sha256")):
         raise ValueError("DeepSpeed did not restore the expected complete native checkpoint")
@@ -203,7 +263,8 @@ def load_fork(study, runtime, manifest, arm, torch):
         retention.atomic_json(Path(study) / arm / "fork_restore_receipt.json", {
             "schema": 1, "status": "verified", "arm": arm, "branch_gamma": BRANCH_GAMMAS[arm],
             "fork_step": FORK_STEP, "completed_updates": FORK_STEP, "consumed_pairs": 192,
-            "fork_receipt_sha256": gradient.file_sha(receipt_path), "rank_guards": guards})
+            "fork_receipt_sha256": gradient.file_sha(receipt_path), "rank_guards": guards,
+            "native_load_policy": "weights_only=False scoped to hash-verified owned native files; global torch.load unchanged"})
     return receipt
 
 

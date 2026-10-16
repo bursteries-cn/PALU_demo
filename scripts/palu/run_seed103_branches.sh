@@ -5,6 +5,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd -- "$SCRIPT_DIR/../.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/.venv/bin/python}"
+STUDY_DIR_WAS_SET="${STUDY_DIR+x}"
 STUDY_DIR="${STUDY_DIR:-$REPO_ROOT/artifacts/seed103_branches/$(TZ=Asia/Shanghai date +%Y%m%d_%H%M%S)}"
 FOUR_GPUS="${FOUR_GPUS:-0,1,2,3}"
 # The original 78 GiB single-GPU guard does not apply to four-rank ZeRO3.
@@ -44,21 +45,46 @@ TRAINING="$REPO_ROOT/scripts/palu/seed103_branch_training.py"
 PREPARE=("$PYTHON_BIN" "$CONTROL" --mode prepare --study "$STUDY_DIR")
 if [[ -n "${MODEL_PATH:-}" ]]; then PREPARE+=(--model-path "$MODEL_PATH"); fi
 if [[ -n "${RETAIN_LOGS:-}" ]]; then PREPARE+=(--retain-logs "$RETAIN_LOGS"); fi
-case "${1:-}" in
-    --dry-run)
-        PREPARE[3]=dry-run
-        "${PREPARE[@]}"
-        printf '\nFOUR_GPUS=%s MIN_FREE_GIB=%s\n' "$FOUR_GPUS" "$MIN_FREE_GIB"
-        exit 0 ;;
-    --analyze-only)
-        "$PYTHON_BIN" "$CONTROL" --mode analyze --study "$STUDY_DIR" --cleanup-fork
-        exit 0 ;;
-    --prepare-only|"") ;;
-    *) echo "Usage: $0 [--dry-run|--prepare-only|--analyze-only]" >&2; exit 2 ;;
-esac
+ACTION="run"
+RESUME_FROM_FORK=0
+for OPTION in "$@"; do
+    case "$OPTION" in
+        --resume-from-fork) RESUME_FROM_FORK=1 ;;
+        --dry-run|--prepare-only|--analyze-only)
+            if [[ "$ACTION" != run ]]; then
+                echo "Choose only one of --dry-run, --prepare-only or --analyze-only." >&2
+                exit 2
+            fi
+            ACTION="$OPTION" ;;
+        *) echo "Usage: $0 [--resume-from-fork] [--dry-run|--prepare-only|--analyze-only]" >&2; exit 2 ;;
+    esac
+done
+if [[ "$RESUME_FROM_FORK" == 1 && -z "$STUDY_DIR_WAS_SET" ]]; then
+    echo "--resume-from-fork requires an explicitly set existing STUDY_DIR." >&2
+    exit 2
+fi
+if [[ "$ACTION" == --dry-run ]]; then
+    PREPARE[3]=dry-run
+    "${PREPARE[@]}"
+    printf '\nFOUR_GPUS=%s MIN_FREE_GIB=%s RESUME_FROM_FORK=%s\n' "$FOUR_GPUS" "$MIN_FREE_GIB" "$RESUME_FROM_FORK"
+    exit 0
+fi
+if [[ "$ACTION" == --analyze-only ]]; then
+    if [[ "$RESUME_FROM_FORK" == 1 ]]; then
+        echo "--resume-from-fork cannot be combined with --analyze-only." >&2
+        exit 2
+    fi
+    "$PYTHON_BIN" "$CONTROL" --mode analyze --study "$STUDY_DIR" --cleanup-fork
+    exit 0
+fi
 cd -- "$REPO_ROOT"
+if [[ "$RESUME_FROM_FORK" == 1 ]]; then
+    RESUME=("${PREPARE[@]}")
+    RESUME[3]=resume-from-fork
+    CUDA_VISIBLE_DEVICES="" "${RESUME[@]}"
+fi
 CUDA_VISIBLE_DEVICES="" "${PREPARE[@]}"
-if [[ "${1:-}" == --prepare-only ]]; then exit 0; fi
+if [[ "$ACTION" == --prepare-only ]]; then exit 0; fi
 mkdir -p -- "$STUDY_DIR/logs"
 printf 'Experiment: %s\n' "$STUDY_DIR"
 printf 'Prefix: 6 complete updates / 192 pairs. Branches: gamma=1,0,0.1; each ends at update60.\n'

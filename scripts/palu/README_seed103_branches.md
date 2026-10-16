@@ -55,6 +55,22 @@ STUDY_DIR=artifacts/seed103_branches/my_run \
   bash scripts/palu/run_seed103_branches.sh --analyze-only
 ```
 
-已完成的公共前缀及分支可复用；每次载入分叉仍检查restart与receipt。不支持任意中断点的半步继续训练：如果一个分支已经写入部分训练但未完成，应保留失败目录，另设新的`STUDY_DIR`重跑。不要手动把incomplete状态改成new或completed。冻结后代码变更也需要新的study。
+已完成的公共前缀及分支可复用；每次载入分叉仍检查restart与receipt。不支持任意中断点的半步继续训练：已经恢复fork并进入实际分支训练的partial run会被拒绝，应保留失败目录。不要手动把incomplete状态改成new或completed。
+
+如果公共前缀已成功保存，而首次分支在读取DeepSpeed原生checkpoint时因`weights_only=True`默认值失败，可显式复用第6步fork，恢复后从第7次完整更新继续，前6步不重跑。恢复命令必须显式设置原`STUDY_DIR`。`FOUR_GPUS`建议沿用原实验物理设备，可查原`logs/continue_gpu_before.log`和分支manifest的`cuda_visible_devices`；脚本不会自动猜测GPU编号：
+
+```bash
+# 先只做CPU恢复准备，不加载模型、不启动GPU。
+STUDY_DIR=artifacts/seed103_branches/原实验目录 \
+  bash scripts/palu/run_seed103_branches.sh --resume-from-fork --prepare-only
+
+# 核验成功后从同一fork运行三支，前6步不重跑。
+STUDY_DIR=artifacts/seed103_branches/原实验目录 FOUR_GPUS=0,1,2,3 \
+  bash scripts/palu/run_seed103_branches.sh --resume-from-fork
+```
+
+恢复前逐项校验5个冻结输入文件、seed103来源、prefix已完整完成6步/192对且无待累积梯度、fork全部文件hash、旧代码snapshot与清单。兼容补丁只允许改变`seed103_branch_training.py`、本控制脚本、本启动脚本和本README；其余损失、数据、padding、评估、优化器设置代码只要变化就拒绝复用。旧代码清单及完整snapshot保存在`compatibility_audit/<时间>/`，再更新这4个文件的snapshot及hash，receipt完整记录前后版本。冻结数据、公共前缀和fork文件保持原样。
+
+自动归档仅限**尚未成功恢复fork、completed_updates=0、目录只有manifest/resolved_config且没有训练或评估记录**的失败初始化目录：整体移入`failed_load_attempts/`，不删除；对应的训练报错、磁盘预检和GPU预检日志一并复制到归档目录的`logs/`，原日志也保留，避免下一次启动tee覆盖后丢失失败证据。存在`fork_restore_receipt.json`、任何实际训练记录或中间checkpoint的partial run会拒绝自动处理。GPU正式训练仍由用户运行启动命令；`--resume-from-fork --prepare-only`始终只做CPU校验与归档。
 
 这是单一seed、单一切换时点的配对干预，能检验当前条件下恢复阶段的效果。MU回升时还应联合检查KS D、逐题TR与正确/错误答案损失；单独FQ变大或变小均不能证明知识删除或恢复。脚本尚需服务器实际运行验证，CPU协议/数学检查不等于完整四卡训练成功。

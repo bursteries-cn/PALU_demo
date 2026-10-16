@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import layout_loss_curve_experiment as source
@@ -252,6 +253,137 @@ def validate_fork_receipt(study, require_tensors=False):
     return receipt
 
 
+COMPATIBILITY_PATCH_FILES = frozenset((
+    "scripts/palu/seed103_branch_training.py",
+    "scripts/palu/seed103_branch_experiment.py",
+    "scripts/palu/run_seed103_branches.sh",
+    "scripts/palu/README_seed103_branches.md",
+))
+
+
+def resume_from_fork(args):
+    """CPU-only recovery from a loader failure before any suffix was restored.
+
+    Frozen scientific inputs and the complete six-update native fork must match.
+    Failed initialization folders are moved intact; trained partial runs cannot
+    be reset. Only the four files belonging to the reviewed compatibility patch
+    may differ from their preparation snapshots, which are first archived.
+    """
+    import checkpoint_retention as retention
+    study = args.study.resolve()
+    description = read_json(study / "experiment.json")
+    if description.get("experiment") != "seed103_four_gpu_global_token_step6_branches":
+        raise ValueError("Resume needs an existing seed103 branch experiment")
+    _, _, _, provenance = source.validate_assets(args.assets)
+    metadata = read_json(study / "frozen/manifest.json")
+    if getattr(args, "model_path", None) is not None and args.model_path.resolve() != Path(metadata["model_path"]).resolve():
+        raise ValueError("Resume cannot change the original Full model path")
+    if metadata.get("seed103_source_provenance") != provenance or description.get("source_provenance") != provenance:
+        raise ValueError("Resume source provenance differs from the original seed103 assets")
+    expected_frozen = {"config.json", "schedule.pt", "retain_reference.json", "epoch_schedule.json", "pair_schedule.jsonl"}
+    if set(metadata.get("frozen_file_sha256", {})) != expected_frozen:
+        raise ValueError("Resume requires the complete immutable five-file frozen input inventory")
+    for name, expected in metadata["frozen_file_sha256"].items():
+        if sha(study / "frozen" / name) != expected:
+            raise ValueError(f"Frozen scientific input changed: {name}")
+    prefix = read_json(study / "prefix/manifest.json")
+    if (prefix.get("status") != "prefix_completed" or prefix.get("completed_updates") != 6 or
+            prefix.get("consumed_pairs") != 192 or prefix.get("pending_pairs") != 0):
+        raise ValueError("Resume requires the committed six-update, 192-pair prefix with no pending gradients")
+    fork = validate_fork_receipt(study, require_tensors=True)
+    fork_sha = sha(study / "fork/receipt.json")
+    if prefix.get("fork_receipt_sha256") != fork_sha:
+        raise ValueError("Prefix points to a different native fork receipt")
+    for key in ("config_sha256", "schedule_sha256", "initial_parameter_sha256", "teacher_parameter_sha256"):
+        if prefix.get(key) != fork.get(key):
+            raise ValueError(f"Prefix and native fork disagree: {key}")
+    old_codes = read_json(study / "code_sha256.json")
+    expected_codes = {str(path.relative_to(ROOT)) for path in code_paths()}
+    if set(old_codes) != expected_codes:
+        raise ValueError("Frozen code inventory differs from this reviewed experiment bundle")
+    changed = []
+    for name, expected in old_codes.items():
+        snapshot = study / "code_snapshot" / name
+        if snapshot.is_symlink() or not snapshot.is_file() or sha(snapshot) != expected:
+            raise ValueError(f"Original code snapshot changed: {name}")
+        if sha(ROOT / name) != expected:
+            if name not in COMPATIBILITY_PATCH_FILES:
+                raise ValueError(f"Scientific code changed outside the compatibility patch: {name}")
+            changed.append(name)
+    candidates = []
+    candidate_logs = {}
+    statuses = {}
+    for arm in ARMS:
+        folder = study / arm["name"]
+        if not folder.exists():
+            statuses[arm["name"]] = "new"
+            continue
+        if folder.is_symlink() or not folder.is_dir():
+            raise ValueError("Branch output must be a real owned directory")
+        manifest = read_json(folder / "manifest.json")
+        if manifest.get("status") == "completed" and manifest.get("completed_updates") == 60:
+            restore = read_json(folder / "fork_restore_receipt.json")
+            if restore.get("status") != "verified" or restore.get("fork_receipt_sha256") != fork_sha:
+                raise ValueError("Completed branch has no verified matching fork restore")
+            statuses[arm["name"]] = "completed"
+            continue
+        files = {str(path.relative_to(folder)) for path in folder.rglob("*") if path.is_file()}
+        if (any(path.is_symlink() for path in folder.rglob("*")) or
+                not files <= {"manifest.json", "resolved_config.json"} or
+                manifest.get("status") not in ("training", "failed") or manifest.get("completed_updates") != 0):
+            raise ValueError(f"Branch {arm['name']} contains restored/partial training results; preserve it. This mode only resets a loader failure before any suffix restore or training.")
+        if any(manifest.get(key) != fork[key] for key in
+               ("config_sha256", "schedule_sha256", "initial_parameter_sha256", "teacher_parameter_sha256")):
+            raise ValueError("Failed initialization belongs to another model, teacher or frozen schedule")
+        logs = [study / "logs" / f"{arm['name']}_{suffix}.log"
+                for suffix in ("train", "disk_before", "gpu_before")]
+        if any(path.is_symlink() or (path.exists() and not path.is_file()) for path in logs):
+            raise ValueError("Failed-load logs must be ordinary files")
+        candidate_logs[arm["name"]] = [path for path in logs if path.is_file()]
+        candidates.append(folder)
+        statuses[arm["name"]] = "failed_initialization_only"
+    # Every input, snapshot, restart shard and branch has passed read-only
+    # verification before the first mutation. No native state is deserialized.
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime()) + f"_{time.time_ns() % 1000000000:09d}"
+    audit = study / "compatibility_audit" / stamp
+    audit.mkdir(parents=True, exist_ok=False)
+    shutil.copyfile(study / "code_sha256.json", audit / "previous_code_sha256.json")
+    shutil.copytree(study / "code_snapshot", audit / "previous_code_snapshot")
+    receipt = {"schema": 1, "status": "verified_pending_refresh", "operation": "resume_from_complete_step6_fork",
+        "created_unix": time.time(), "fork_receipt_sha256": fork_sha,
+        "prefix_manifest_sha256": sha(study / "prefix/manifest.json"),
+        "frozen_file_sha256": metadata["frozen_file_sha256"], "old_code_sha256": old_codes,
+        "allowed_compatibility_files": sorted(COMPATIBILITY_PATCH_FILES), "changed_files": sorted(changed),
+        "branch_states_before": statuses, "quarantined_attempts": [],
+        "scope": "CPU metadata/restart-inventory verification and failed-load quarantine only; no model load, GPU initialization or optimizer update"}
+    retention.atomic_json(audit / "receipt.json", receipt)
+    for folder in candidates:
+        destination = study / "failed_load_attempts" / f"{folder.name}_{stamp}"
+        destination.parent.mkdir(exist_ok=True)
+        folder.rename(destination)
+        if candidate_logs[folder.name]:
+            (destination / "logs").mkdir()
+            for log in candidate_logs[folder.name]:
+                shutil.copyfile(log, destination / "logs" / log.name)
+        receipt["quarantined_attempts"].append(str(destination.relative_to(study)))
+        retention.atomic_json(audit / "receipt.json", receipt)
+    current_codes = dict(old_codes)
+    for name in sorted(COMPATIBILITY_PATCH_FILES):
+        target = study / "code_snapshot" / name
+        temporary = target.with_name(target.name + ".compat.tmp")
+        shutil.copyfile(ROOT / name, temporary)
+        temporary.replace(target)
+        current_codes[name] = sha(ROOT / name)
+    retention.atomic_json(study / "code_sha256.json", current_codes)
+    receipt.update(status="ready_to_resume_from_fork", new_code_sha256=current_codes,
+        prefix_and_fork_unmodified=True)
+    retention.atomic_json(audit / "receipt.json", receipt)
+    print(json.dumps({"status": receipt["status"], "study": str(study), "audit": str(audit),
+        "fork_step": 6, "fork_consumed_pairs": 192, "changed_files": receipt["changed_files"],
+        "quarantined_attempts": receipt["quarantined_attempts"], "gpu_training_started": False}, ensure_ascii=False))
+    return receipt
+
+
 def collect_results(study):
     study = Path(study).resolve()
     description = read_json(study / "experiment.json")
@@ -479,7 +611,7 @@ def plot(output, epochs, online):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("dry-run", "prepare", "check-gpus", "check-storage", "analyze"), required=True)
+    parser.add_argument("--mode", choices=("dry-run", "prepare", "check-gpus", "check-storage", "resume-from-fork", "analyze"), required=True)
     parser.add_argument("--study", type=Path, default=ROOT / "artifacts/seed103_branches/preview")
     parser.add_argument("--assets", type=Path, default=ASSETS)
     parser.add_argument("--model-path", type=Path)
@@ -502,6 +634,8 @@ def main():
         source.check_gpus(args)
     elif args.mode == "check-storage":
         check_storage(args)
+    elif args.mode == "resume-from-fork":
+        resume_from_fork(args)
     else:
         analyze(args)
 
