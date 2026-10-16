@@ -185,3 +185,5 @@ cython_debug/
 /reports/representation_batching/
 /artifacts/palu_mean_ablation/
 /artifacts/palu/
+# Local frozen experiment inputs and historical measurements
+/configs/analysis/layout_loss_seed103/
