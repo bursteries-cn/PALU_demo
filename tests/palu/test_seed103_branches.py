@@ -68,6 +68,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual((plan["fork_after_updates"], plan["fork_consumed_pairs"]), (6, 192))
         self.assertEqual(plan["optimizer_updates_per_path"], 60)
         self.assertEqual(plan["actual_training_updates_executed"], 6 + 3 * 54)
+        self.assertEqual(plan["eval_every_epochs"], 2)
+        self.assertEqual(plan["evaluation_backend"], "sharded")
+        self.assertEqual(plan["evaluation_steps"], [0, 12, 25, 37, 50, 60])
         self.assertEqual({row["name"]: row["gamma"] for row in plan["arms"]}, branches.BRANCH_GAMMAS)
 
     def test_storage_accounts_for_full_adam_restart_and_three_final_models(self):
@@ -204,6 +207,35 @@ class ResultAuditTests(unittest.TestCase):
         rows[6]["gamma_used"] = 1.0
         self.write_rows(path, rows)
         with self.assertRaisesRegex(ValueError, "gamma"):
+            self.collect()
+
+    def test_two_epoch_protocol_accepts_only_its_frozen_observations(self):
+        path = self.study / "experiment.json"
+        description = replay.read_json(path)
+        description.update(eval_every_epochs=2, evaluation_backend="sharded",
+                           evaluation_steps=[0, 12, 25, 37, 50, 60])
+        experiment.write_json(path, description)
+        with self.assertRaisesRegex(ValueError, "missing initial, epoch or final"):
+            self.collect()
+        for arm in branches.BRANCH_GAMMAS:
+            self.rows[arm] = [dict(row, evaluation_backend="sharded", eval_every_epochs=2)
+                              for row in self.rows[arm] if row["step"] in description["evaluation_steps"]]
+            # The second measured state is now step12, after the interventions.
+            # It is expected to differ; only the shared initial state must match.
+            self.rows[arm][1]["raw_sensitive_loss"] += branches.BRANCH_GAMMAS[arm]
+            self.write_rows(self.study / arm / "epoch_history.jsonl", self.rows[arm])
+            manifest_path = self.study / arm / "manifest.json"
+            manifest = replay.read_json(manifest_path)
+            manifest["checkpoints"] = [row for row in manifest["checkpoints"] if row["step"] in description["evaluation_steps"]]
+            experiment.write_json(manifest_path, manifest)
+        epochs, online, _ = self.collect()
+        self.assertTrue(all(len(rows) == 6 for rows in epochs.values()))
+        self.assertTrue(all(len(rows) == 60 for rows in online.values()))
+
+    def test_old_protocol_still_rejects_different_step_six_metrics(self):
+        self.rows["weak"][1]["raw_sensitive_loss"] += 1
+        self.write_rows(self.study / "weak/epoch_history.jsonl", self.rows["weak"])
+        with self.assertRaisesRegex(ValueError, "initial/step-six"):
             self.collect()
 
     def test_changed_pair_is_rejected(self):

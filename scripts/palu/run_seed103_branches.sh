@@ -11,6 +11,8 @@ FOUR_GPUS="${FOUR_GPUS:-0,1,2,3}"
 # The original 78 GiB single-GPU guard does not apply to four-rank ZeRO3.
 # This is a free-memory guard, not a guarantee that all evaluation kernels fit.
 MIN_FREE_GIB="${MIN_FREE_GIB:-40}"
+EVAL_EVERY_EPOCHS="${EVAL_EVERY_EPOCHS:-2}"
+EVAL_BACKEND="${EVAL_BACKEND:-sharded}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE=1
@@ -43,6 +45,7 @@ STUDY_DIR="$("$PYTHON_BIN" -c 'from pathlib import Path; import sys; print(Path(
 CONTROL="$REPO_ROOT/scripts/palu/seed103_branch_experiment.py"
 TRAINING="$REPO_ROOT/scripts/palu/seed103_branch_training.py"
 PREPARE=("$PYTHON_BIN" "$CONTROL" --mode prepare --study "$STUDY_DIR")
+PREPARE+=(--eval-every-epochs "$EVAL_EVERY_EPOCHS" --eval-backend "$EVAL_BACKEND")
 if [[ -n "${MODEL_PATH:-}" ]]; then PREPARE+=(--model-path "$MODEL_PATH"); fi
 if [[ -n "${RETAIN_LOGS:-}" ]]; then PREPARE+=(--retain-logs "$RETAIN_LOGS"); fi
 ACTION="run"
@@ -88,7 +91,7 @@ if [[ "$ACTION" == --prepare-only ]]; then exit 0; fi
 mkdir -p -- "$STUDY_DIR/logs"
 printf 'Experiment: %s\n' "$STUDY_DIR"
 printf 'Prefix: 6 complete updates / 192 pairs. Branches: gamma=1,0,0.1; each ends at update60.\n'
-printf 'Actual epoch evaluation is immediate. Only verified intermediate weights are deleted; final models and all observations are retained.\n'
+printf 'Evaluation: initial, every %s actual epochs, final; backend=%s. Only verified intermediate weights are deleted; final models and all observations are retained.\n' "$EVAL_EVERY_EPOCHS" "$EVAL_BACKEND"
 trap 'rc=$?; printf "Stopped (exit %s). Results/restart files preserved in %s\n" "$rc" "$STUDY_DIR" >&2; exit "$rc"' ERR
 
 status_of() {

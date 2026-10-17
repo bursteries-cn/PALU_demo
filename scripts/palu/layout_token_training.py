@@ -187,7 +187,9 @@ def save_checkpoint(model, tokenizer, output, step, initial_hash, torch, rank, d
     return row
 
 
-def setup(config, layout, seed, torch):
+def setup(config, layout, seed, torch, *, student_checkpoint=None):
+    if student_checkpoint is not None and layout != "four":
+        raise ValueError("Checkpoint evaluation setup requires four ranks to preserve the original Full teacher")
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_scheduler
     from trainer.utils import seed_everything
     distributed = layout == "four"
@@ -223,7 +225,7 @@ def setup(config, layout, seed, torch):
         ds_config = gradient.resolved_deepspeed(json.loads(Path(ds_path).read_text()), model_config.hidden_size, accumulation, world)
         ds_config["gradient_clipping"] = float(train_args.get("max_grad_norm", 1.0))
         holder = HfDeepSpeedConfig(ds_config)
-        model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, **model_args)
+        model = AutoModelForCausalLM.from_pretrained(student_checkpoint or model_path, torch_dtype=torch.bfloat16, **model_args)
         reference = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, **model_args)
         reference.requires_grad_(False)
         reference.config.use_cache = False

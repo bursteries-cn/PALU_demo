@@ -283,6 +283,8 @@ class BranchControl:
         self.runtime, self.manifest, self.torch = runtime, manifest, torch
         manifest.update(requested_updates=60, final_model_step=60, planned_updates=60, smoke_prefix=False,
             experiment="seed103_token_normalized_three_branches", fork_step=FORK_STEP, fork_consumed_pairs=192,
+            eval_every_epochs=getattr(args, "eval_every_epochs", 1),
+            evaluation_backend=getattr(args, "eval_backend", "legacy"),
             phase=self.phase, branch_gamma=None if self.phase == "prefix" else BRANCH_GAMMAS[self.arm],
             fixed_loss_total_definition="canonical F+2R+2KL; gamma=1 for every fixed diagnostic",
             training_gamma_definition="gamma=1 through update6; branch gamma from update7",
@@ -339,11 +341,14 @@ def main():
         parser.error("--arm is required only for branch phase")
     import torch
     study = args.study.resolve()
+    description = json.loads((study / "frozen/manifest.json").read_text())
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
         raise ValueError("Launch with torchrun --nproc_per_node=4")
     options = argparse.Namespace(config=study / "frozen/config.json", schedule=study / "frozen/schedule.pt",
         output=study / ("prefix" if args.phase == "prefix" else args.arm), layout="four", seed=103,
         normalization="global", padding_scope="microbatch", online_evaluation=True,
+        eval_every_epochs=description.get("eval_every_epochs", 1),
+        eval_backend=description.get("evaluation_backend", "legacy"),
         delete_evaluated_intermediate=True, max_updates=None)
     base.train(options, torch, control=BranchControl(study, args.phase, args.arm))
     torch.distributed.destroy_process_group()

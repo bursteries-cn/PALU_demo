@@ -1,9 +1,9 @@
 """Pause PALU at actual epoch edges, evaluate, commit, prune, then resume.
 
-No optimizer is rebuilt and no pending gradient is flushed. With ZeRO-3, rank
-zero drives the unmodified TOFU evaluator and broadcasts each HF forward before
-its parameter-gather hooks run. Other ranks execute the same forward, retaining
-their KV cache locally. Only rank zero makes decoding decisions and writes data.
+No optimizer is rebuilt and no pending gradient is flushed. The legacy backend
+mirrors rank zero's forwards. The sharded backend distributes distinct fixed
+examples and original TOFU batches, then merges per-example observations before
+native metric aggregation. Existing studies retain their frozen backend/cadence.
 """
 from contextlib import contextmanager, nullcontext
 import copy
@@ -15,10 +15,11 @@ import random
 from types import SimpleNamespace
 
 
-def epoch_events(total_pairs=1920, forget_size=200, effective_batch=32):
-    if min(total_pairs, forget_size, effective_batch) <= 0:
+def epoch_events(total_pairs=1920, forget_size=200, effective_batch=32, every_epochs=1):
+    if min(total_pairs, forget_size, effective_batch, every_epochs) <= 0 or int(every_epochs) != every_epochs:
         raise ValueError("Training sizes must be positive")
-    exposures = [0, *range(forget_size, total_pairs + 1, forget_size)]
+    interval = forget_size * int(every_epochs)
+    exposures = [0, *range(interval, total_pairs + 1, interval)]
     if exposures[-1] != total_pairs:
         exposures.append(total_pairs)
     return [{"step": consumed // effective_batch,
@@ -291,13 +292,62 @@ def build_probe(config, schedule, runtime, output, torch):
     return probe
 
 
+def evaluate_probe(config, schedule, runtime, output, torch, *, backend="legacy", step=0,
+                   epoch=0.0, epoch_index=0, expected_fixed_hash=None, probe=None):
+    """Shared online/standalone entry; all ranks participate and restore RNG/modes."""
+    from trainer.palu_diagnostics import preserve_rng_and_modes
+    rank, distributed = runtime["rank"], runtime["distributed"]
+    if backend not in ("legacy", "sharded") or backend == "sharded" and not distributed:
+        raise ValueError("Unknown backend or sample-parallel evaluation without distributed ranks")
+    models = {"student": runtime["model"], "reference": getattr(runtime["reference"], "module", runtime["reference"])}
+    rpc = CoordinatedForward(models, runtime["device"], torch) if distributed and backend == "legacy" else None
+    parallel = None
+    if backend == "sharded":
+        from sharded_epoch_evaluation import ShardedEvaluation
+        parallel = ShardedEvaluation(torch)
+    row, error = None, None
+    with preserve_rng_and_modes([runtime["engine"], runtime["reference"]], runtime["device"]), torch.no_grad():
+        if rank == 0 or parallel:
+            try:
+                if probe is None:
+                    destination = Path(output) if rank == 0 else Path(output) / f"rank-{rank}"
+                    probe = build_probe(config, schedule, runtime, destination, torch)
+                with parallel.activate(probe, models) if parallel else rpc.root_models() if rpc else nullcontext():
+                    probe._prepare_fixed_data()
+                    if expected_fixed_hash and probe._epoch_fixed_manifest["fixed_dataset_sha256"] != expected_fixed_hash:
+                        raise AssertionError("Online fixed datasets differ from the frozen schedule")
+                    probe.state.global_step, probe.state.epoch = step, epoch
+                    probe._epoch_context.update(epoch_index=epoch_index, epoch_end_seen=True)
+                    probe.evaluate()
+                if rank == 0:
+                    row = json.loads((probe.epoch_output / "epoch_history.jsonl").read_text().splitlines()[-1])
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                # A local error inside sharded model work may leave peers in a
+                # collective. Let torchrun abort the process group immediately.
+                if parallel:
+                    raise
+            finally:
+                if rpc:
+                    rpc.finish(error)
+        else:
+            error = rpc.workers()
+    if error:
+        raise RuntimeError(error)
+    stats = parallel.stats if parallel else {"rank": rank, "forward_calls": rpc.calls if rpc else None,
+                                            "cached_decode_forwards": rpc.generated_tokens if rpc else None}
+    return probe, row, stats
+
+
 class OnlineEpochEvaluation:
     def __init__(self, args, config, schedule, runtime, manifest, torch):
         self.args, self.config, self.schedule = args, config, schedule
         self.runtime, self.manifest, self.torch = runtime, manifest, torch
         self.output = args.output.resolve()
         self.events = {event["consumed_pairs"]: event for event in epoch_events(
-            total_pairs=32 * manifest["requested_updates"], forget_size=schedule["metadata"]["data_sizes"]["forget"])}
+            total_pairs=32 * manifest["requested_updates"], forget_size=schedule["metadata"]["data_sizes"]["forget"],
+            every_epochs=getattr(args, "eval_every_epochs", 1))}
+        self.backend = getattr(args, "eval_backend", "legacy")
         self.probe, self.rows = None, []
 
     def at(self, consumed_pairs, completed_updates, save_checkpoint):
@@ -307,7 +357,6 @@ class OnlineEpochEvaluation:
         if event["step"] != completed_updates:
             raise AssertionError("Epoch evaluation is on the wrong side of an optimizer update")
         import checkpoint_retention as retention
-        from trainer.palu_diagnostics import preserve_rng_and_modes
         runtime, manifest, torch = self.runtime, self.manifest, self.torch
         rank, distributed = runtime["rank"], runtime["distributed"]
         before = runtime_fingerprint(runtime, torch)
@@ -322,32 +371,16 @@ class OnlineEpochEvaluation:
         if rank == 0:
             retention.atomic_json(self.output / "manifest.json", manifest)
             print(json.dumps({"event": "epoch_evaluation_begin", **event}), flush=True)
-        rpc, error, row = None, None, None
-        models = {"student": runtime["model"], "reference": getattr(runtime["reference"], "module", runtime["reference"])}
-        with preserve_rng_and_modes([runtime["engine"], runtime["reference"]], runtime["device"]), torch.no_grad():
-            if distributed:
-                rpc = CoordinatedForward(models, runtime["device"], torch)
-            if rank == 0:
-                try:
-                    if self.probe is None:
-                        self.probe = build_probe(self.config, self.schedule, runtime, self.output, torch)
-                    with rpc.root_models() if rpc else nullcontext():
-                        probe = self.probe
-                        probe._prepare_fixed_data()
-                        if probe._epoch_fixed_manifest["fixed_dataset_sha256"] != manifest["schedule_metadata"]["fixed_dataset_sha256"]:
-                            raise AssertionError("Online fixed datasets differ from the frozen schedule")
-                        probe.state.global_step = completed_updates
-                        probe.state.epoch = event["weight_update_epochs"]
-                        probe._epoch_context.update(epoch_index=event["source_epoch_index"], epoch_end_seen=True)
-                        probe.evaluate()
-                    row = json.loads((probe.epoch_output / "epoch_history.jsonl").read_text().splitlines()[-1])
-                except Exception as exc:
-                    error = f"{type(exc).__name__}: {exc}"
-                finally:
-                    if rpc:
-                        rpc.finish(error)
-            else:
-                error = rpc.workers()
+        error, row, stats = None, None, {}
+        try:
+            self.probe, row, stats = evaluate_probe(self.config, self.schedule, runtime, self.output, torch,
+                backend=self.backend, step=completed_updates, epoch=event["weight_update_epochs"],
+                epoch_index=event["source_epoch_index"],
+                expected_fixed_hash=manifest["schedule_metadata"]["fixed_dataset_sha256"], probe=self.probe)
+        except Exception as exc:
+            if self.backend == "sharded":
+                raise
+            error = f"{type(exc).__name__}: {exc}"
         after = runtime_fingerprint(runtime, torch)
         differences = [key for key in before if before[key] != after[key]]
         guard = {"rank": rank, "step": completed_updates, "consumed_pairs": consumed_pairs,
@@ -355,8 +388,7 @@ class OnlineEpochEvaluation:
                  "changed_sections": differences,
                  "before_sha256": hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest(),
                  "after_sha256": hashlib.sha256(json.dumps(after, sort_keys=True).encode()).hexdigest(),
-                 "forward_calls": rpc.calls if rpc else None,
-                 "cached_decode_forwards": rpc.generated_tokens if rpc else None}
+                 **stats, "evaluation_backend": self.backend}
         guards = [None] * runtime["world"] if distributed else [guard]
         if distributed:
             torch.distributed.all_gather_object(guards, guard)
@@ -375,7 +407,8 @@ class OnlineEpochEvaluation:
                     checkpoint_path=checkpoint["checkpoint"], training_layout=manifest["layout"],
                     training_normalization=manifest["normalization"], training_padding_scope=manifest["padding_scope"],
                     training_schedule_sha256=manifest["schedule_sha256"],
-                    evaluation_model="current in-memory training model; native evaluator driven by rank0; no optimizer restart",
+                    evaluation_model="current in-memory training model; " + self.backend + " native evaluation; no optimizer restart",
+                    evaluation_backend=self.backend, eval_every_epochs=getattr(self.args, "eval_every_epochs", 1),
                     training_state_unchanged_all_ranks=True)
                 for key in ("actual_epoch_microbatches", "expected_epoch_microbatches", "training_examples_this_epoch",
                             "unique_forget_examples_this_epoch", "unique_retain_examples_this_epoch", "unique_retain_examples_cumulative"):

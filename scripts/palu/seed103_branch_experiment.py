@@ -49,6 +49,10 @@ estimate; stage checks use current free space and completed final inventories.
 
 
 def plan(args):
+    from online_epoch_evaluation import epoch_events
+    every = getattr(args, "eval_every_epochs", 2)
+    backend = getattr(args, "eval_backend", "sharded")
+    events = epoch_events(every_epochs=every)
     config, pairs, history, provenance = source.validate_assets(args.assets)
     result = source.plan(args)
     result.update(experiment="seed103_four_gpu_global_token_step6_branches", arms=list(ARMS),
@@ -59,8 +63,10 @@ def plan(args):
         method_prefix=config["trainer"]["method_args"],
         branch_objective="gamma*F + 2*R + 2*common_KL; gamma=1,0,0.1 after complete update 6",
         fork_policy="Save native DeepSpeed model, Adam moments, FP32 master, scheduler, update counters and per-rank RNG at 192 consumed pairs; each arm restores and validates the same restart state.",
-        epoch_one_policy="Fork after update 6 at 192 pairs; evaluate epoch 1 after 200 consumed pairs with 8 pending pairs and the arm-specific pending gradients intact.",
-        evaluation_timing="Initial state plus every actual 200-pair epoch edge and final1920; evaluate immediately before the next training microbatch, preserve live state, validate all observations, then delete intermediate model weights.",
+        epoch_one_policy="Fork after update 6 at 192 pairs. Evaluation cadence is independent of this fork; pending gradients remain intact at selected epoch edges.",
+        eval_every_epochs=every, evaluation_backend=backend,
+        evaluation_steps=[event["step"] for event in events],
+        evaluation_timing=f"Initial state plus every {every} actual 200-pair epochs and final1920; evaluate immediately before the next training microbatch, preserve live state, validate all observations, then delete intermediate model weights.",
         checkpoint_retention="Keep three final models and all observations; delete intermediate weights after verified evaluation, and shared restart tensors only after all arms pass result validation.",
         temporary_restart_snapshots=1, final_model_snapshots=3,
         peak_model_snapshots=3,
@@ -81,10 +87,15 @@ def code_paths():
         "scripts/palu/layout_loss_curve_experiment.py", "scripts/palu/layout_token_training.py",
         "scripts/palu/gradient_equivalence_step.py", "scripts/palu/prepare_layout_schedule.py",
         "scripts/palu/checkpoint_retention.py", "scripts/palu/online_epoch_evaluation.py",
+        "scripts/palu/sharded_epoch_evaluation.py", "scripts/palu/benchmark_sharded_evaluation.py",
+        "scripts/palu/run_evaluation_benchmark.sh",
         "scripts/palu/plot_seed_epoch.py", "src/trainer/palu_epoch_eval.py",
         "src/trainer/unlearn/palu.py", "src/trainer/unlearn/grad_diff.py",
         "src/trainer/palu_diagnostics.py", "src/data/qa.py", "src/data/unlearn.py",
         "src/data/collators.py", "src/trainer/utils.py",
+        "src/evals/base.py", "src/evals/tofu.py", "src/evals/metrics/base.py",
+        "src/evals/metrics/utils.py", "src/evals/metrics/memorization.py",
+        "src/evals/metrics/privacy.py", "src/evals/metrics/utility.py",
         "configs/accelerate/zero_stage3_offload_config.json")]
 
 
@@ -109,8 +120,12 @@ def prepare(args):
         metadata = read_json(frozen / "manifest.json")
         if metadata["seed103_source_provenance"] != description["source_provenance"]:
             raise ValueError("Existing study uses different source assets")
-        if read_json(study / "experiment.json").get("experiment") != description["experiment"]:
+        previous = read_json(study / "experiment.json")
+        if previous.get("experiment") != description["experiment"]:
             raise ValueError("Existing folder is not this branch experiment; choose a new STUDY_DIR")
+        if (previous.get("eval_every_epochs", 1) != description["eval_every_epochs"] or
+                previous.get("evaluation_backend", "legacy") != description["evaluation_backend"]):
+            raise ValueError("Existing study has a different frozen evaluation protocol; use a new STUDY_DIR")
         for name, expected in metadata["frozen_file_sha256"].items():
             if sha(frozen / name) != expected:
                 raise ValueError(f"Existing frozen study file changed: {name}")
@@ -197,11 +212,15 @@ def prepare(args):
         seed103_source_provenance=description["source_provenance"], packages=packages,
         model_weight_files={path.name: path.stat().st_size for path in weight_paths},
         evaluation_policy=description["evaluation_timing"], evaluation_steps=description["evaluation_steps"],
-        actual_epoch_events=epoch_events(), normalization="global", padding_scope="microbatch",
+        actual_epoch_events=epoch_events(every_epochs=description["eval_every_epochs"]),
+        eval_every_epochs=description["eval_every_epochs"], evaluation_backend=description["evaluation_backend"],
+        normalization="global", padding_scope="microbatch",
         fork_after_updates=6, fork_consumed_pairs=192, snapshot_storage_budget=budget,
         full_update_denominators="Separate sensitive, retain and common token totals over each 32-pair update")
     torch.save(payload, frozen / "schedule.pt")
-    write_json(frozen / "epoch_schedule.json", metadata["epoch_evaluation_schedule"])
+    # Windows retain the source replay metadata; this file describes the
+    # actual selected pause points of this newly frozen online protocol.
+    write_json(frozen / "epoch_schedule.json", metadata["actual_epoch_events"])
     (frozen / "pair_schedule.jsonl").write_text("".join(json.dumps({"step": window["step"], **pair}) + "\n"
         for window in payload["windows"] for pair in window["pair_records"]), encoding="utf-8")
     metadata["frozen_file_sha256"] = {name: sha(frozen / name) for name in
@@ -397,7 +416,7 @@ def collect_results(study):
         raise ValueError("Frozen schedule must contain the actual 1920 consumed F/R pairs")
     epochs, online, manifests = {}, {}, {}
     from online_epoch_evaluation import epoch_events
-    expected_events = epoch_events()
+    expected_events = epoch_events(every_epochs=description.get("eval_every_epochs", 1))
     import checkpoint_retention as retention
     for arm in ARMS:
         folder = study / arm["name"]
@@ -426,6 +445,9 @@ def collect_results(study):
         if len(rows) != len(expected_events) or [row["step"] for row in rows] != description["evaluation_steps"]:
             raise ValueError("Branch is missing initial, epoch or final observations")
         for row, event in zip(rows, expected_events):
+            if (row.get("evaluation_backend", "legacy") != description.get("evaluation_backend", "legacy") or
+                    row.get("eval_every_epochs", 1) != description.get("eval_every_epochs", 1)):
+                raise ValueError("Evaluation backend or cadence differs from the frozen protocol")
             if any(row.get(key) != event[key] for key in ("step", "consumed_pairs", "updated_pairs", "pending_pairs")):
                 raise ValueError("Evaluation did not occur at an actual 200-pair epoch boundary")
             if not row.get("training_state_unchanged_all_ranks"):
@@ -476,7 +498,9 @@ def collect_results(study):
     for arm in ARMS[1:]:
         if online[arm["name"]][:6] != online["continue"][:6]:
             raise ValueError("Shared prefix update records differ across branches")
-        for left, right in zip(epochs["continue"][:2], epochs[arm["name"]][:2]):
+        shared = [row for row in epochs["continue"] if row["step"] <= 6]
+        other_shared = [row for row in epochs[arm["name"]] if row["step"] <= 6]
+        for left, right in zip(shared, other_shared):
             if any(not math.isclose(left[key], right[key], rel_tol=1e-6, abs_tol=1e-12) for key in MEASURES):
                 raise ValueError("Identical initial/step-six weights produced inconsistent branch evaluations")
     return epochs, online, manifests
@@ -517,7 +541,9 @@ def analyze(args):
                             "KS_D_absolute_gap": abs(a["ks_d"] - b["ks_d"])})
     write_csv(output / "matched_FR_pairs.csv", comparisons)
     summary = {"status": "validated", "fork_step": 6, "fork_consumed_pairs": 192,
-        "fork_restore_verified_all_arms": True, "initial_step6_observations_consistent": True,
+        "fork_restore_verified_all_arms": True,
+        "shared_prefix_observation_steps": [row["step"] for row in epochs["continue"] if row["step"] <= 6],
+        "initial_step6_observations_consistent": True if any(row["step"] == 6 for row in epochs["continue"]) else None,
         "same_inputs_initial_model_teacher_measurement_reference": True, "single_seed_only": True,
         "states_per_arm": {name: len(rows) for name, rows in epochs.items()},
         "endpoints": {name: {key: rows[-1][key] for key in MEASURES} for name, rows in epochs.items()},
@@ -561,8 +587,9 @@ def plot(output, epochs, online):
     labels = {arm["name"]: arm["label"] for arm in ARMS}
     colors = {arm["name"]: plotting.COLORS[index] for index, arm in enumerate(ARMS)}
     markers = {arm["name"]: plotting.MARKERS[index] for index, arm in enumerate(ARMS)}
+    observed_steps = [row["step"] for row in epochs["continue"]]
     note = ("One shared seed103 prefix; three paired interventions, not independent training seeds. No smoothing or seed SD.\n"
-            "Fork after complete update 6 (192 pairs); epoch 1 evaluated at 200 pairs with 8 pending pairs.\n"
+            f"Fork after complete update 6 (192 pairs); measured updates: {', '.join(map(str, observed_steps))}.\n"
             "Fixed losses: token-weighted F200/R3800. FQ is a KS p-value. Zero values stay in CSV and are omitted on log axes.")
     def line(ax, name, rows, xkey, ykey):
         ax.plot([row[xkey] for row in rows],
@@ -596,7 +623,7 @@ def plot(output, epochs, online):
                 rows = [row for row in history if (not log_loss or row[xkey] > 0)]
                 line(ax, name, rows, xkey, ykey)
                 for row in rows:
-                    if row["step"] in (0, 6, 60) and (ykey != "forget_quality" or row[ykey] > 0):
+                    if row["step"] in (0, 6 if 6 in observed_steps else observed_steps[1], 60) and (ykey != "forget_quality" or row[ykey] > 0):
                         ax.annotate(str(row["step"]), (row[xkey], row[ykey]), fontsize=6)
             plotting.style_axis(ax, ylabel, xlabel, ykey == "forget_quality")
             if log_loss:
@@ -621,6 +648,8 @@ def main():
     parser.add_argument("--stage", choices=("prefix", "continue", "repair", "weak"), default="prefix")
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--cleanup-fork", action="store_true")
+    parser.add_argument("--eval-every-epochs", type=int, default=2)
+    parser.add_argument("--eval-backend", choices=("legacy", "sharded"), default="sharded")
     args = parser.parse_args()
     if args.mode == "dry-run":
         print(json.dumps(plan(args), ensure_ascii=False, indent=2))
