@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/.venv/bin/python}"
 STUDY_DIR="${STUDY_DIR:-$REPO_ROOT/artifacts/overshoot_seed_replicates/$(TZ=Asia/Shanghai date +%Y%m%d_%H%M%S)}"
-GPUS="${GPUS:-0}"
+GPUS="${GPUS:-0,1,2}"
 SEEDS="${SEEDS:-201,202,203}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 PYTHONUNBUFFERED=1

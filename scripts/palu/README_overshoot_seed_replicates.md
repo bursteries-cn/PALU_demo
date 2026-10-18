@@ -15,11 +15,11 @@
 从包含本次提交的PALU仓库运行。当前服务器另有未提交实验代码，因此单独部署到 `PALU/launchers/overshoot_seed_replicates_20261019`；在该目录执行同样命令即可，环境和数据复用原仓库：
 
 ```bash
-GPUS=0 bash scripts/palu/run_overshoot_seed_replicates.sh --dry-run
-GPUS=0 bash scripts/palu/run_overshoot_seed_replicates.sh
+GPUS=0,1,2 bash scripts/palu/run_overshoot_seed_replicates.sh --dry-run
+GPUS=0,1,2 bash scripts/palu/run_overshoot_seed_replicates.sh
 ```
 
-默认在一张卡上顺序跑9次；若有三张空闲卡，可用 `GPUS=0,1,2` 并行运行三个独立单卡队列。这不改变每次训练的world size。每张卡默认要求空闲78 GiB；不足会退出，不会自动改变batch或停止其他任务。
+默认 `GPUS=0,1,2`，按配置固定分卡：P336→GPU0、P421→GPU1、P386→GPU2。三个配置并行，每个配置的seed201/202/203在对应卡上顺序运行。GPUS必须给出三个不同编号，顺序始终对应P336/P421/P386，例如 `GPUS=4,5,6`。映射写入manifest，并为每次运行记录GPU UUID；每次训练world size仍为1。每张卡默认要求空闲78 GiB；不足会退出，不会自动改变batch或停止其他任务。
 
 ```bash
 GPUS=0,1,2 STUDY_DIR="$PWD/artifacts/overshoot_seed_replicates/my_run" \

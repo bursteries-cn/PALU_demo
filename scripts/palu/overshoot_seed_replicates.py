@@ -67,7 +67,7 @@ def parse():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--mode', choices=['dry-run', 'prepare', 'run', 'analyze'], required=True)
     p.add_argument('--study', type=Path, required=True)
-    p.add_argument('--gpus', default='0')
+    p.add_argument('--gpus', default='0,1,2')
     p.add_argument('--seeds', default='201,202,203')
     p.add_argument('--min-free-gib', type=float, default=78)
     p.add_argument('--model-path', type=Path)
@@ -78,8 +78,8 @@ def parse():
     args.gpus = [s.strip() for s in args.gpus.split(',')]
     if len(args.seeds) != 3 or len(set(args.seeds)) != 3 or min(args.seeds) < 1:
         p.error('Use exactly three distinct positive seeds; historical seed 0 is excluded')
-    if not all(args.gpus) or len(set(args.gpus)) != len(args.gpus):
-        p.error('GPUS must contain distinct nonempty GPU identifiers')
+    if len(args.gpus) != len(IDS) or not all(args.gpus) or len(set(args.gpus)) != len(IDS):
+        p.error('Use exactly three distinct GPUs, assigned to P336, P421 and P386 in that order')
     if args.min_free_gib <= 0:
         p.error('min-free-gib must be positive')
     return args
@@ -95,6 +95,8 @@ def prepare(args):
         old = read(study / 'manifest.json')
         if old['seeds'] != args.seeds or old['source_provenance'] != provenance:
             raise ValueError('Existing study has different seeds or source configs')
+        if old.get('gpu_assignments') != dict(zip(IDS, args.gpus)):
+            raise ValueError('Existing study has different config-to-GPU assignments')
         for name, value in old['code_sha256'].items():
             if sha(ROOT / name) != value: raise ValueError(f'Code changed since preparation: {name}')
         for name, value in old['frozen_sha256'].items():
@@ -167,7 +169,8 @@ def prepare(args):
     manifest = dict(schema=1, study_type='historical_overshoot_seed_replication', seeds=args.seeds,
                     runs=planned, source_provenance=provenance, model_path=str(model), tofu_data_path=str(tofu_data),
                     model_weight_bytes=model_bytes, planned_final_weight_bytes=model_bytes * 9,
-                    packages=packages, training_world_size=1, microbatch=8, accumulation=4,
+                    packages=packages, gpu_assignments=dict(zip(IDS, args.gpus)),
+                    training_world_size=1, microbatch=8, accumulation=4,
                     loss_normalization='original microbatch target-token means; equal microbatch accumulation',
                     evaluation_steps=EVAL_STEPS, eval_every_actual_epochs=2, fixed_loss_data='all F200/R3800, batch1, token-weighted and sample means',
                     primary_intervals={cid: [provenance['configs'][cid]['primary_anchor_step'], 60] for cid in IDS},
@@ -200,8 +203,8 @@ def verify_run(entry):
 
 def train(args, manifest):
     logdir = args.study / 'logs'; logdir.mkdir(exist_ok=True)
-    queues = [[] for _ in args.gpus]
-    for i, entry in enumerate(manifest['runs']): queues[i % len(queues)].append(entry)
+    queues = [[entry for entry in manifest['runs'] if entry['model'] == cid] for cid in IDS]
+    print('Config-to-GPU assignment: ' + json.dumps(dict(zip(IDS, args.gpus))), flush=True)
     def worker(gpu, entries):
         for entry in entries:
             output = Path(entry['output_dir']); cid, seed = entry['model'], entry['seed']
@@ -285,7 +288,8 @@ def main():
     args = parse(); configs, provenance = sources()
     if args.mode == 'dry-run':
         print(json.dumps(dict(configs={k: EXPECTED[k] for k in IDS}, tuple_order=['lr','alpha','first_n','top_k'],
-                              seeds=args.seeds, gpus=args.gpus, runs=9, world_size_per_run=1, microbatch=8, accumulation=4,
+                              seeds=args.seeds, gpus=args.gpus, gpu_assignments=dict(zip(IDS, args.gpus)),
+                              runs=9, world_size_per_run=1, microbatch=8, accumulation=4,
                               evaluation_steps=EVAL_STEPS, primary_intervals={k:[v['primary_anchor_step'],60] for k,v in provenance['configs'].items()},
                               study=str(args.study), training_started=False), indent=2)); return
     if args.mode == 'analyze': analyze(args.study); return
