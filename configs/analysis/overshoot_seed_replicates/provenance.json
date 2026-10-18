@@ -1,0 +1,24 @@
+{
+  "reference_sha256": "d94b259bc878e1a38f97cc0fac6937147d09d5958cd24d7fe0437d4be7d3a29f",
+  "configs": {
+    "P336": {
+      "original_config_sha256": "d8185bafceb95942861f8693f9a17b6bd6ae9ad69a1e7a6ccb5f0b292ca34359",
+      "asset_sha256": "f3b03f2d2debfe9b0c0a9bb9d82ad31f765f343119f19f397956e19902890f7c",
+      "primary_anchor_step": 25,
+      "original_best_FQ_step": 25
+    },
+    "P421": {
+      "original_config_sha256": "49a2f59b90820dc606c8b3f89e97ac22a28e2bb5d7068f1022718fb49b933691",
+      "asset_sha256": "55f03156d9aa6d698bcd50d87e68b438ddf1ac6935b5dc1babc51fff1865a617",
+      "primary_anchor_step": 12,
+      "original_best_FQ_step": 18
+    },
+    "P386": {
+      "original_config_sha256": "bcd95c20134d82171ca44e9fd0756f81fd86c0ca29b2d26e83c20db608fa1fd3",
+      "asset_sha256": "8c8a8803227bd493f6ebc3803f8ce263fe65c40828aeecd8b4fb1908a49118a4",
+      "primary_anchor_step": 12,
+      "original_best_FQ_step": 18
+    }
+  },
+  "portable_assets": "Only local paths and output names are replaced; original source configs remain in the private research evidence archive."
+}

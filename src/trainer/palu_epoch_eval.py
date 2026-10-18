@@ -137,6 +137,9 @@ class PALUEpochTrainer(PALU):
         if self.retain_loss_type != "NLL" or self.non_sensitive_constraint_type != "kl":
             raise ValueError("This protocol requires Retain NLL and common-token KL")
         self.epoch_options = dict(epoch_options or {})
+        self.eval_every_epochs = int(self.epoch_options.get("eval_every_epochs", 1))
+        if self.eval_every_epochs < 1:
+            raise ValueError("eval_every_epochs must be positive")
         self.epoch_output = Path(self.args.output_dir)
         self.epoch_output.mkdir(parents=True, exist_ok=True)
         for name in ("epoch_history.jsonl", "fixed_loss_samples.jsonl"):
@@ -209,6 +212,9 @@ class PALUEpochTrainer(PALU):
                 fixed[split].append((index, sample))
             metadata[split] = {"dataset_size": len(dataset), "count": len(indices), "indices": indices}
         self._epoch_fixed = fixed
+        expected = self.epoch_options.get("expected_fixed_data_sha256")
+        if expected and digest.hexdigest() != expected:
+            raise ValueError("Tokenized fixed data differs from the study preflight")
         self._epoch_fixed_manifest = {
             "fixed_dataset_sha256": digest.hexdigest(), "fixed_indices": metadata,
             "fixed_loss_batch_size": 1,
@@ -292,6 +298,10 @@ class PALUEpochTrainer(PALU):
         step, epoch = int(self.state.global_step), float(self.state.epoch or 0.0)
         if step == self._last_epoch_evaluated_step:
             return {}
+        final = step > 0 and step >= getattr(self.state, "max_steps", math.inf)
+        every = getattr(self, "eval_every_epochs", 1)  # Evaluation-only probes bypass __init__.
+        if step > 0 and not final and self._epoch_context["epoch_index"] % every:
+            return {}
         output = self.epoch_output / f"checkpoint-{step}" / "evals"
         output.mkdir(parents=True, exist_ok=True)
         device = self.accelerator.device
@@ -361,6 +371,9 @@ class PALUEpochTrainer(PALU):
         _atomic_json(output / "epoch_provenance.json", {**row, "metrics": metrics,
                      "evaluation_model": "current in-memory training model; no reload",
                      "rng_and_module_modes_restored": True})
+        if self.epoch_options.get("verify_observations"):
+            from trainer.palu_epoch_artifacts import finalize_observation
+            finalize_observation(self.epoch_output, row, reference_path, int(self.state.max_steps))
         self._last_epoch_evaluated_step = step
         self.log(add_neg_log_pvalue_metrics({**metrics, "forget_ks_statistic": d}))
         return metrics

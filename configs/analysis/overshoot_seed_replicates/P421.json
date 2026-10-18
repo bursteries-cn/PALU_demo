@@ -1,0 +1,759 @@
+{
+  "model": {
+    "handler": "Llama-3.1-8B-Instruct",
+    "model_args": {
+      "pretrained_model_name_or_path": "open-unlearning/tofu_Llama-3.1-8B-Instruct_full",
+      "attn_implementation": "sdpa",
+      "torch_dtype": "bfloat16"
+    },
+    "tokenizer_args": {
+      "pretrained_model_name_or_path": "open-unlearning/tofu_Llama-3.1-8B-Instruct_full"
+    },
+    "template_args": {
+      "apply_chat_template": true,
+      "system_prompt": "You are a helpful assistant.",
+      "system_prompt_with_special_tokens": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|>",
+      "user_start_tag": "<|start_header_id|>user<|end_header_id|>\n\n",
+      "user_end_tag": "<|eot_id|>",
+      "asst_start_tag": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+      "asst_end_tag": "<|eot_id|>",
+      "date_string": "10 Apr 2025"
+    }
+  },
+  "trainer": {
+    "handler": "PALU",
+    "args": {
+      "per_device_train_batch_size": 8,
+      "per_device_eval_batch_size": 16,
+      "gradient_accumulation_steps": 4,
+      "learning_rate": 4e-05,
+      "bf16": true,
+      "bf16_full_eval": true,
+      "logging_steps": 1,
+      "output_dir": "${paths.output_dir}",
+      "logging_dir": "${trainer.args.output_dir}/logs",
+      "report_to": "wandb",
+      "run_name": "overshoot_P421_source_seed0",
+      "ddp_find_unused_parameters": true,
+      "gradient_checkpointing": true,
+      "optim": "paged_adamw_32bit",
+      "save_strategy": "no",
+      "save_only_model": true,
+      "weight_decay": 0.01,
+      "do_train": true,
+      "do_eval": true,
+      "eval_on_start": true,
+      "eval_strategy": "epoch",
+      "num_train_epochs": 10,
+      "seed": 0,
+      "warmup_epochs": 1.0,
+      "remove_unused_columns": false
+    },
+    "method_args": {
+      "gamma": 1.0,
+      "alpha": 5,
+      "retain_loss_type": "NLL",
+      "top_k": 1000,
+      "first_n": 5,
+      "target_mode": "mean",
+      "non_sensitive_constraint_type": "kl"
+    }
+  },
+  "data": {
+    "forget": {
+      "TOFU_QA_forget_gpt": {
+        "handler": "QAwithLabelDataset",
+        "args": {
+          "hf_args": {
+            "name": "${forget_split}",
+            "dataset": "TOFU",
+            "classifier": "gpt"
+          },
+          "question_key": "question",
+          "answer_key": "answer",
+          "target_key": "target_words",
+          "common_key": "common_words",
+          "max_length": 512
+        }
+      }
+    },
+    "retain": {
+      "TOFU_QA_retain": {
+        "handler": "QADataset",
+        "args": {
+          "hf_args": {
+            "name": "${retain_split}",
+            "split": "train",
+            "path": "${paths.tofu_data}"
+          },
+          "question_key": "question",
+          "answer_key": "answer",
+          "max_length": 512
+        }
+      }
+    },
+    "anchor": "forget"
+  },
+  "collator": {
+    "DataCollatorForSupervisedDataset": {
+      "handler": "DataCollatorForSupervisedDataset",
+      "args": {
+        "padding_side": "right"
+      }
+    }
+  },
+  "eval": {
+    "tofu": {
+      "metrics": {
+        "model_utility": {
+          "pre_compute": {
+            "retain_Q_A_Prob": {
+              "datasets": {
+                "TOFU_QA_retain_eval": {
+                  "handler": "QADataset",
+                  "args": {
+                    "hf_args": {
+                      "name": "retain_perturbed",
+                      "split": "train",
+                      "path": "${paths.tofu_data}"
+                    },
+                    "question_key": "${eval.tofu.question_key}",
+                    "answer_key": "answer",
+                    "max_length": 512
+                  }
+                }
+              },
+              "collators": {
+                "DataCollatorForSupervisedDataset": {
+                  "handler": "DataCollatorForSupervisedDataset",
+                  "args": {
+                    "padding_side": "right",
+                    "index": "index"
+                  }
+                }
+              },
+              "handler": "probability",
+              "batch_size": "${eval.tofu.batch_size}"
+            },
+            "retain_Q_A_ROUGE": {
+              "datasets": {
+                "TOFU_QA_retain_eval": {
+                  "handler": "QADataset",
+                  "args": {
+                    "hf_args": {
+                      "name": "retain_perturbed",
+                      "split": "train",
+                      "path": "${paths.tofu_data}"
+                    },
+                    "question_key": "${eval.tofu.question_key}",
+                    "answer_key": "answer",
+                    "max_length": 512,
+                    "predict_with_generate": true
+                  }
+                }
+              },
+              "collators": {
+                "DataCollatorForSupervisedDataset": {
+                  "handler": "DataCollatorForSupervisedDataset",
+                  "args": {
+                    "padding_side": "left",
+                    "index": "index"
+                  }
+                }
+              },
+              "generation_args": {
+                "do_sample": false,
+                "top_p": null,
+                "temperature": null,
+                "max_new_tokens": 200,
+                "use_cache": true
+              },
+              "handler": "rouge",
+              "rouge_type": "rougeL_recall",
+              "batch_size": "${eval.tofu.batch_size}"
+            },
+            "retain_Truth_Ratio": {
+              "pre_compute": {
+                "retain_Q_A_PARA_Prob": {
+                  "datasets": {
+                    "TOFU_QA_retain_para": {
+                      "handler": "QADataset",
+                      "args": {
+                        "hf_args": {
+                          "name": "retain_perturbed",
+                          "split": "train",
+                          "path": "${paths.tofu_data}"
+                        },
+                        "question_key": "${eval.tofu.question_key}",
+                        "answer_key": "paraphrased_answer",
+                        "max_length": 512
+                      }
+                    }
+                  },
+                  "collators": {
+                    "DataCollatorForSupervisedDataset": {
+                      "handler": "DataCollatorForSupervisedDataset",
+                      "args": {
+                        "padding_side": "right",
+                        "index": "index"
+                      }
+                    }
+                  },
+                  "handler": "probability",
+                  "batch_size": "${eval.tofu.batch_size}",
+                  "access_key": "correct"
+                },
+                "retain_Q_A_PERT_Prob": {
+                  "datasets": {
+                    "TOFU_QA_retain_pert": {
+                      "handler": "QADataset",
+                      "args": {
+                        "hf_args": {
+                          "name": "retain_perturbed",
+                          "split": "train",
+                          "path": "${paths.tofu_data}"
+                        },
+                        "question_key": "${eval.tofu.question_key}",
+                        "answer_key": "perturbed_answer",
+                        "max_length": 512
+                      }
+                    }
+                  },
+                  "collators": {
+                    "DataCollatorForSupervisedDataset": {
+                      "handler": "DataCollatorForSupervisedDataset",
+                      "args": {
+                        "padding_side": "right",
+                        "index": "index"
+                      }
+                    }
+                  },
+                  "handler": "probability",
+                  "batch_size": "${eval.tofu.batch_size}",
+                  "access_key": "wrong"
+                }
+              },
+              "handler": "truth_ratio",
+              "aggregator": "true_better"
+            },
+            "ra_Q_A_Prob_normalised": {
+              "pre_compute": {
+                "ra_Q_A_Prob": {
+                  "datasets": {
+                    "TOFU_QA_ra": {
+                      "handler": "QADataset",
+                      "args": {
+                        "hf_args": {
+                          "name": "real_authors_perturbed",
+                          "split": "train",
+                          "path": "${paths.tofu_data}"
+                        },
+                        "question_key": "question",
+                        "answer_key": "answer",
+                        "max_length": 512
+                      }
+                    }
+                  },
+                  "collators": {
+                    "DataCollatorForSupervisedDataset": {
+                      "handler": "DataCollatorForSupervisedDataset",
+                      "args": {
+                        "padding_side": "right",
+                        "index": "index"
+                      }
+                    }
+                  },
+                  "handler": "probability",
+                  "batch_size": "${eval.tofu.batch_size}",
+                  "access_key": "correct"
+                },
+                "ra_Q_A_PERT_Prob": {
+                  "datasets": {
+                    "TOFU_QA_ra_pert": {
+                      "handler": "QADataset",
+                      "args": {
+                        "hf_args": {
+                          "name": "real_authors_perturbed",
+                          "split": "train",
+                          "path": "${paths.tofu_data}"
+                        },
+                        "question_key": "question",
+                        "answer_key": "perturbed_answer",
+                        "max_length": 512
+                      }
+                    }
+                  },
+                  "collators": {
+                    "DataCollatorForSupervisedDataset": {
+                      "handler": "DataCollatorForSupervisedDataset",
+                      "args": {
+                        "padding_side": "right",
+                        "index": "index"
+                      }
+                    }
+                  },
+                  "handler": "probability",
+                  "batch_size": "${eval.tofu.batch_size}",
+                  "access_key": "wrong"
+                }
+              },
+              "handler": "probability_w_options"
+            },
+            "ra_Q_A_ROUGE": {
+              "datasets": {
+                "TOFU_QA_ra": {
+                  "handler": "QADataset",
+                  "args": {
+                    "hf_args": {
+                      "name": "real_authors_perturbed",
+                      "split": "train",
+                      "path": "${paths.tofu_data}"
+                    },
+                    "question_key": "question",
+                    "answer_key": "answer",
+                    "max_length": 512,
+                    "predict_with_generate": true
+                  }
+                }
+              },
+              "collators": {
+                "DataCollatorForSupervisedDataset": {
+                  "handler": "DataCollatorForSupervisedDataset",
+                  "args": {
+                    "padding_side": "left",
+                    "index": "index"
+                  }
+                }
+              },
+              "generation_args": {
+                "do_sample": false,
+                "top_p": null,
+                "temperature": null,
+                "max_new_tokens": 200,
+                "use_cache": true
+              },
+              "handler": "rouge",
+              "rouge_type": "rougeL_recall",
+              "batch_size": "${eval.tofu.batch_size}"
+            },
+            "ra_Truth_Ratio": {
+              "pre_compute": {
+                "ra_Q_A_Prob": {
+                  "datasets": {
+                    "TOFU_QA_ra": {
+                      "handler": "QADataset",
+                      "args": {
+                        "hf_args": {
+                          "name": "real_authors_perturbed",
+                          "split": "train",
+                          "path": "${paths.tofu_data}"
+                        },
+                        "question_key": "question",
+                        "answer_key": "answer",
+                        "max_length": 512
+                      }
+                    }
+                  },
+                  "collators": {
+                    "DataCollatorForSupervisedDataset": {
+                      "handler": "DataCollatorForSupervisedDataset",
+                      "args": {
+                        "padding_side": "right",
+                        "index": "index"
+                      }
+                    }
+                  },
+                  "handler": "probability",
+                  "batch_size": "${eval.tofu.batch_size}",
+                  "access_key": "correct"
+                },
+                "ra_Q_A_PERT_Prob": {
+                  "datasets": {
+                    "TOFU_QA_ra_pert": {
+                      "handler": "QADataset",
+                      "args": {
+                        "hf_args": {
+                          "name": "real_authors_perturbed",
+                          "split": "train",
+                          "path": "${paths.tofu_data}"
+                        },
+                        "question_key": "question",
+                        "answer_key": "perturbed_answer",
+                        "max_length": 512
+                      }
+                    }
+                  },
+                  "collators": {
+                    "DataCollatorForSupervisedDataset": {
+                      "handler": "DataCollatorForSupervisedDataset",
+                      "args": {
+                        "padding_side": "right",
+                        "index": "index"
+                      }
+                    }
+                  },
+                  "handler": "probability",
+                  "batch_size": "${eval.tofu.batch_size}",
+                  "access_key": "wrong"
+                }
+              },
+              "handler": "truth_ratio",
+              "aggregator": "true_better"
+            },
+            "wf_Q_A_Prob_normalised": {
+              "pre_compute": {
+                "wf_Q_A_Prob": {
+                  "datasets": {
+                    "TOFU_QA_wf": {
+                      "handler": "QADataset",
+                      "args": {
+                        "hf_args": {
+                          "name": "world_facts_perturbed",
+                          "split": "train",
+                          "path": "${paths.tofu_data}"
+                        },
+                        "question_key": "question",
+                        "answer_key": "answer",
+                        "max_length": 512
+                      }
+                    }
+                  },
+                  "collators": {
+                    "DataCollatorForSupervisedDataset": {
+                      "handler": "DataCollatorForSupervisedDataset",
+                      "args": {
+                        "padding_side": "right",
+                        "index": "index"
+                      }
+                    }
+                  },
+                  "handler": "probability",
+                  "batch_size": "${eval.tofu.batch_size}",
+                  "access_key": "correct"
+                },
+                "wf_Q_A_PERT_Prob": {
+                  "datasets": {
+                    "TOFU_QA_wf_pert": {
+                      "handler": "QADataset",
+                      "args": {
+                        "hf_args": {
+                          "name": "world_facts_perturbed",
+                          "split": "train",
+                          "path": "${paths.tofu_data}"
+                        },
+                        "question_key": "question",
+                        "answer_key": "perturbed_answer",
+                        "max_length": 512
+                      }
+                    }
+                  },
+                  "collators": {
+                    "DataCollatorForSupervisedDataset": {
+                      "handler": "DataCollatorForSupervisedDataset",
+                      "args": {
+                        "padding_side": "right",
+                        "index": "index"
+                      }
+                    }
+                  },
+                  "handler": "probability",
+                  "batch_size": "${eval.tofu.batch_size}",
+                  "access_key": "wrong"
+                }
+              },
+              "handler": "probability_w_options"
+            },
+            "wf_Q_A_ROUGE": {
+              "datasets": {
+                "TOFU_QA_wf": {
+                  "handler": "QADataset",
+                  "args": {
+                    "hf_args": {
+                      "name": "world_facts_perturbed",
+                      "split": "train",
+                      "path": "${paths.tofu_data}"
+                    },
+                    "question_key": "question",
+                    "answer_key": "answer",
+                    "max_length": 512,
+                    "predict_with_generate": true
+                  }
+                }
+              },
+              "collators": {
+                "DataCollatorForSupervisedDataset": {
+                  "handler": "DataCollatorForSupervisedDataset",
+                  "args": {
+                    "padding_side": "left",
+                    "index": "index"
+                  }
+                }
+              },
+              "generation_args": {
+                "do_sample": false,
+                "top_p": null,
+                "temperature": null,
+                "max_new_tokens": 200,
+                "use_cache": true
+              },
+              "handler": "rouge",
+              "rouge_type": "rougeL_recall",
+              "batch_size": "${eval.tofu.batch_size}"
+            },
+            "wf_Truth_Ratio": {
+              "pre_compute": {
+                "wf_Q_A_Prob": {
+                  "datasets": {
+                    "TOFU_QA_wf": {
+                      "handler": "QADataset",
+                      "args": {
+                        "hf_args": {
+                          "name": "world_facts_perturbed",
+                          "split": "train",
+                          "path": "${paths.tofu_data}"
+                        },
+                        "question_key": "question",
+                        "answer_key": "answer",
+                        "max_length": 512
+                      }
+                    }
+                  },
+                  "collators": {
+                    "DataCollatorForSupervisedDataset": {
+                      "handler": "DataCollatorForSupervisedDataset",
+                      "args": {
+                        "padding_side": "right",
+                        "index": "index"
+                      }
+                    }
+                  },
+                  "handler": "probability",
+                  "batch_size": "${eval.tofu.batch_size}",
+                  "access_key": "correct"
+                },
+                "wf_Q_A_PERT_Prob": {
+                  "datasets": {
+                    "TOFU_QA_wf_pert": {
+                      "handler": "QADataset",
+                      "args": {
+                        "hf_args": {
+                          "name": "world_facts_perturbed",
+                          "split": "train",
+                          "path": "${paths.tofu_data}"
+                        },
+                        "question_key": "question",
+                        "answer_key": "perturbed_answer",
+                        "max_length": 512
+                      }
+                    }
+                  },
+                  "collators": {
+                    "DataCollatorForSupervisedDataset": {
+                      "handler": "DataCollatorForSupervisedDataset",
+                      "args": {
+                        "padding_side": "right",
+                        "index": "index"
+                      }
+                    }
+                  },
+                  "handler": "probability",
+                  "batch_size": "${eval.tofu.batch_size}",
+                  "access_key": "wrong"
+                }
+              },
+              "handler": "truth_ratio",
+              "aggregator": "true_better"
+            }
+          },
+          "handler": "hm_aggregate"
+        },
+        "forget_quality": {
+          "pre_compute": {
+            "forget_truth_ratio": {
+              "pre_compute": {
+                "forget_Q_A_PARA_Prob": {
+                  "datasets": {
+                    "TOFU_QA_forget_para": {
+                      "handler": "QADataset",
+                      "args": {
+                        "hf_args": {
+                          "name": "${eval.tofu.forget_split}_perturbed",
+                          "split": "train",
+                          "path": "${paths.tofu_data}"
+                        },
+                        "question_key": "${eval.tofu.question_key}",
+                        "answer_key": "paraphrased_answer",
+                        "max_length": 512
+                      }
+                    }
+                  },
+                  "collators": {
+                    "DataCollatorForSupervisedDataset": {
+                      "handler": "DataCollatorForSupervisedDataset",
+                      "args": {
+                        "padding_side": "right",
+                        "index": "index"
+                      }
+                    }
+                  },
+                  "handler": "probability",
+                  "batch_size": "${eval.tofu.batch_size}",
+                  "access_key": "correct"
+                },
+                "forget_Q_A_PERT_Prob": {
+                  "datasets": {
+                    "TOFU_QA_forget_pert": {
+                      "handler": "QADataset",
+                      "args": {
+                        "hf_args": {
+                          "name": "${eval.tofu.forget_split}_perturbed",
+                          "split": "train",
+                          "path": "${paths.tofu_data}"
+                        },
+                        "question_key": "${eval.tofu.question_key}",
+                        "answer_key": "perturbed_answer",
+                        "max_length": 512
+                      }
+                    }
+                  },
+                  "collators": {
+                    "DataCollatorForSupervisedDataset": {
+                      "handler": "DataCollatorForSupervisedDataset",
+                      "args": {
+                        "padding_side": "right",
+                        "index": "index"
+                      }
+                    }
+                  },
+                  "handler": "probability",
+                  "batch_size": "${eval.tofu.batch_size}",
+                  "access_key": "wrong"
+                }
+              },
+              "handler": "truth_ratio",
+              "aggregator": "closer_to_1_better",
+              "access_key": "forget"
+            }
+          },
+          "reference_logs": {
+            "retain_model_logs": {
+              "path": "${eval.tofu.retain_logs_path}",
+              "include": {
+                "forget_truth_ratio": {
+                  "access_key": "retain"
+                }
+              }
+            }
+          },
+          "handler": "ks_test"
+        },
+        "forget_Q_A_gibberish": {
+          "pre_compute": {
+            "forget_Q_A_ROUGE": {
+              "datasets": {
+                "TOFU_QA_forget": {
+                  "handler": "QADataset",
+                  "args": {
+                    "hf_args": {
+                      "name": "${eval.tofu.forget_split}_perturbed",
+                      "split": "train",
+                      "path": "${paths.tofu_data}"
+                    },
+                    "question_key": "${eval.tofu.question_key}",
+                    "answer_key": "answer",
+                    "max_length": 512,
+                    "predict_with_generate": true
+                  }
+                }
+              },
+              "collators": {
+                "DataCollatorForSupervisedDataset": {
+                  "handler": "DataCollatorForSupervisedDataset",
+                  "args": {
+                    "padding_side": "left",
+                    "index": "index"
+                  }
+                }
+              },
+              "generation_args": {
+                "do_sample": false,
+                "top_p": null,
+                "temperature": null,
+                "max_new_tokens": 200,
+                "use_cache": true
+              },
+              "handler": "rouge",
+              "rouge_type": "rougeL_recall",
+              "batch_size": "${eval.tofu.batch_size}",
+              "access_key": "text"
+            }
+          },
+          "handler": "classifier_prob",
+          "batch_size": 32,
+          "max_length": 32,
+          "class_id": 0,
+          "text_key": "generation",
+          "device": "cuda",
+          "classifier_model_args": {
+            "pretrained_model_name_or_path": "${paths.root_dir}/models/gibberish-detector"
+          },
+          "classifier_tokenization_args": {
+            "pretrained_model_name_or_path": "${paths.root_dir}/models/gibberish-detector"
+          }
+        },
+        "exact_memorization": {
+          "datasets": {
+            "TOFU_QA_forget": {
+              "handler": "QADataset",
+              "args": {
+                "hf_args": {
+                  "name": "${eval.tofu.forget_split}_perturbed",
+                  "split": "train",
+                  "path": "${paths.tofu_data}"
+                },
+                "question_key": "${eval.tofu.question_key}",
+                "answer_key": "answer",
+                "max_length": 512
+              }
+            }
+          },
+          "collators": {
+            "DataCollatorForSupervisedDataset": {
+              "handler": "DataCollatorForSupervisedDataset",
+              "args": {
+                "padding_side": "right",
+                "index": "index"
+              }
+            }
+          },
+          "handler": "exact_memorization",
+          "batch_size": "${eval.tofu.batch_size}"
+        }
+      },
+      "handler": "TOFUEvaluator",
+      "output_dir": "${paths.output_dir}",
+      "overwrite": true,
+      "forget_split": "${forget_split}",
+      "holdout_split": "${holdout_split}",
+      "retain_logs_path": "./saves/eval/tofu_Llama-3.1-8B-Instruct_retain95/TOFU_EVAL.json",
+      "question_key": "${question_key}",
+      "batch_size": 32
+    }
+  },
+  "paths": {
+    "root_dir": ".",
+    "data_dir": "${paths.root_dir}/data/",
+    "datasets": "${paths.root_dir}/configs/data/datasets",
+    "output_dir": "./artifacts/overshoot_seed_replicates/P421",
+    "work_dir": "${hydra:runtime.cwd}",
+    "tofu_data": "${paths.root_dir}/datasets/TOFU"
+  },
+  "forget_split": "forget05",
+  "retain_split": "retain95",
+  "holdout_split": "holdout05",
+  "retain_logs_path": null,
+  "question_key": "question",
+  "task_name": "overshoot_P421_source_seed0",
+  "mode": "unlearn",
+  "do_save": false
+}
