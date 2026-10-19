@@ -122,11 +122,12 @@ def raw_components(model, reference, inputs, *, top_k, first_n, eos, torch):
 
 
 def weighted_loss(components, local_counts, global_counts, *, gamma, alpha,
-                  normalization, accumulation, world):
-    coefficient = {"sensitive": gamma, "retain": alpha, "common": alpha}
+                  normalization, accumulation, world, common=None):
+    common = alpha if common is None else common
+    coefficient = {"sensitive": gamma, "retain": alpha, "common": common}
     if normalization == "native":
         # Preserve the actual PALU operand/order: gamma*F + alpha*R + alpha*KL.
-        return gamma * components["sensitive"] + alpha * components["retain"] + alpha * components["common"]
+        return gamma * components["sensitive"] + alpha * components["retain"] + common * components["common"]
     return sum(coefficient[key] * components[key]
                * (accumulation * world * local_counts[key] / max(global_counts[key], 1))
                for key in ("sensitive", "retain", "common"))

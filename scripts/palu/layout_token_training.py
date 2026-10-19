@@ -61,8 +61,9 @@ def atomic_json(path, payload):
     temporary.replace(path)
 
 
-def loss_record(raw, gamma, alpha):
-    weighted = [gamma * raw["sensitive"], alpha * raw["retain"], alpha * raw["common"]]
+def loss_record(raw, gamma, alpha, common=None):
+    common = alpha if common is None else common
+    weighted = [gamma * raw["sensitive"], alpha * raw["retain"], common * raw["common"]]
     return {"loss": sum(weighted), "loss_total": sum(weighted), "loss_forget": weighted[0],
             "loss_retain_nll": weighted[1], "loss_common_kl": weighted[2],
             "raw_sensitive_loss": raw["sensitive"], "raw_retain_nll": raw["retain"],
@@ -85,10 +86,40 @@ def microbatch_inputs(window, indices, device, padding_scope):
 
 def assert_learning_rate(values, completed_updates, runtime, train_args):
     warmup, total = runtime["warmup_steps"], runtime["scheduler_total_updates"]
-    factor = completed_updates / max(1, warmup) if completed_updates < warmup else max(0.0, (total - completed_updates) / max(1, total - warmup))
+    kind = train_args.get("lr_scheduler_type", "linear")
+    if kind == "constant":
+        if warmup != 0:
+            raise ValueError("Constant learning rate requires explicit zero warmup")
+        factor = 1.0
+    elif kind == "linear":
+        factor = completed_updates / max(1, warmup) if completed_updates < warmup else max(0.0, (total - completed_updates) / max(1, total - warmup))
+    else:
+        raise ValueError(f"Unsupported controlled learning-rate schedule: {kind}")
     expected = float(train_args["learning_rate"]) * factor
     if any(not math.isclose(value, expected, rel_tol=1e-10, abs_tol=1e-14) for value in values):
         raise AssertionError(f"Learning-rate schedule mismatch after {completed_updates} updates: {values} vs {expected}")
+
+
+def planned_update_budget(control):
+    """Only an explicit experiment controller may replace the historical budget."""
+    planned = getattr(control, "planned_updates", 60)
+    if isinstance(planned, bool) or not isinstance(planned, int) or planned <= 0:
+        raise ValueError("Controller planned_updates must be a positive integer")
+    return planned
+
+
+def objective_coefficients(control, step, method):
+    """Set phase weights once per complete update, preserving old gamma hooks."""
+    gamma, alpha = float(method["gamma"]), float(method["alpha"])
+    if control is not None and hasattr(control, "coefficients_for_step"):
+        gamma, alpha, common = map(float, control.coefficients_for_step(step))
+    else:
+        if control is not None:
+            gamma = float(control.gamma_for_step(step))
+        common = alpha
+    if any(not math.isfinite(value) or value < 0 for value in (gamma, alpha, common)):
+        raise ValueError("PALU objective coefficients must be finite and nonnegative")
+    return gamma, alpha, common
 
 
 def optimizer_groups(model, train_args):
@@ -274,22 +305,26 @@ def train(args, torch, control=None):
         raise ValueError("train requires --config --schedule --output")
     config = json.loads(args.config.read_text())
     method, train_args = config["trainer"]["method_args"], config["trainer"]["args"]
+    planned_updates = planned_update_budget(control)
+    explicit_budget = control is not None and hasattr(control, "planned_updates")
+    if explicit_budget and train_args.get("max_steps") != planned_updates:
+        raise AssertionError("Controller budget differs from the explicit configuration max_steps")
     for key, expected in (("target_mode", "mean"), ("retain_loss_type", "NLL"), ("non_sensitive_constraint_type", "kl")):
         if method.get(key, expected) != expected:
             raise ValueError(f"Unsupported PALU {key}")
     schedule = torch.load(args.schedule, map_location="cpu", weights_only=True)
     windows = schedule["windows"]
     if args.max_updates is None:
-        if len(windows) != 60 or schedule["metadata"]["effective_batch"] != 32:
-            raise AssertionError("Formal study requires exactly 60 complete windows of 32 pairs")
+        if len(windows) != planned_updates or schedule["metadata"]["effective_batch"] != 32:
+            raise AssertionError(f"Formal study requires exactly {planned_updates} complete windows of 32 pairs")
         if Path(config["model"]["model_args"]["pretrained_model_name_or_path"]).resolve() != Path(schedule["metadata"]["model_path"]).resolve():
             raise AssertionError("Formal initial model path differs from frozen schedule provenance")
         if schedule["metadata"].get("source_config_sha256") != gradient.file_sha(args.config):
             raise AssertionError("Formal source configuration differs from frozen schedule provenance")
     if args.max_updates is not None:
         windows = windows[:args.max_updates]
-    if not windows or len(windows) > 60 or any(int(window["step"]) != i + 1 for i, window in enumerate(windows)):
-        raise ValueError("Expected a contiguous at-most-60 update schedule")
+    if not windows or len(windows) > planned_updates or any(int(window["step"]) != i + 1 for i, window in enumerate(windows)):
+        raise ValueError(f"Expected a contiguous at-most-{planned_updates} update schedule")
     from prepare_layout_schedule import tensor_hashes, canonical_sha
     for window in windows:
         for split in ("forget", "retain"):
@@ -307,8 +342,12 @@ def train(args, torch, control=None):
     if control is not None:
         windows = control.select_windows(windows)
     runtime = setup(config, args.layout, args.seed, torch)
-    if runtime["scheduler_total_updates"] != 60 or config["trainer"]["args"].get("lr_scheduler_type", "linear") != "linear":
-        raise AssertionError("Historical study requires an explicit 60-update linear schedule")
+    scheduler_kind = train_args.get("lr_scheduler_type", "linear")
+    supported_schedulers = ("linear", "constant") if explicit_budget else ("linear",)
+    if runtime["scheduler_total_updates"] != planned_updates or scheduler_kind not in supported_schedulers:
+        raise AssertionError(f"Controlled study requires {planned_updates} updates and one of {supported_schedulers}")
+    if scheduler_kind == "constant" and runtime["warmup_steps"] != 0:
+        raise AssertionError("Constant learning rate requires explicit zero warmup")
     model, reference, engine = (runtime[key] for key in ("model", "reference", "engine"))
     optimizer, scheduler = runtime["optimizer"], runtime["scheduler"]
     rank, world, distributed = runtime["rank"], runtime["world"], runtime["distributed"]
@@ -340,7 +379,7 @@ def train(args, torch, control=None):
                 "loss_mode": args.normalization, "padding_scope": args.padding_scope, "seed": args.seed,
                 "world_size": world, "batch_size": 1 if distributed else 8,
                 "gradient_accumulation_steps": accumulation, "effective_batch": 32,
-                "planned_updates": 60, "requested_updates": len(windows),
+                "planned_updates": planned_updates, "requested_updates": len(windows),
                 "final_model_step": len(windows),
                 "smoke_prefix": args.max_updates is not None,
                 "schedule_path": str(args.schedule.resolve()), "schedule_sha256": gradient.file_sha(args.schedule),
@@ -370,7 +409,6 @@ def train(args, torch, control=None):
         atomic_json(output / "manifest.json", manifest)
     if control is not None:
         control.initialize(runtime, manifest, config, schedule, args, torch)
-    gamma, alpha = float(method["gamma"]), float(method["alpha"])
     online = None
     if args.online_evaluation:
         from online_epoch_evaluation import OnlineEpochEvaluation
@@ -387,8 +425,7 @@ def train(args, torch, control=None):
             online.at(0, 0, save_event)
     for window in windows:
         step = int(window["step"])
-        if control is not None:
-            gamma = control.gamma_for_step(step)
+        gamma, alpha, common = objective_coefficients(control, step, method)
         counts = gradient.target_counts(window, tokenizer.eos_token_id, int(method["first_n"]), torch)
         if counts != window["counts"] or any(counts[key] <= 0 for key in counts):
             raise AssertionError(f"Invalid whole-window denominators at {step}")
@@ -411,7 +448,7 @@ def train(args, torch, control=None):
                 components = gradient.raw_components(engine, reference, inputs, top_k=int(method["top_k"]),
                            first_n=int(method["first_n"]), eos=tokenizer.eos_token_id, torch=torch)
                 loss = gradient.weighted_loss(components, local, counts, gamma=gamma, alpha=alpha,
-                               normalization=args.normalization, accumulation=accumulation, world=world)
+                               common=common, normalization=args.normalization, accumulation=accumulation, world=world)
             if not bool(torch.isfinite(loss.detach())):
                 raise AssertionError(f"Nonfinite loss at update {step}")
             for key in counts:
@@ -489,8 +526,8 @@ def train(args, torch, control=None):
                    "pair_sha256": window.get("pair_sha256"), "microbatches_all_ranks": accumulation * world,
                    "loss_reduction": "pre-update whole-window target-token mean" if args.normalization == "global" else "pre-update equal mean over all native rank/microbatch means",
                    "loss_mode": args.normalization, "padding_scope": args.padding_scope,
-                   "window_token_mean": loss_record(token_raw, gamma, alpha),
-                   **loss_record(raw, gamma, alpha), "grad_norm": norm_value, "grad_norm_dtype": norm_dtype,
+                   "window_token_mean": loss_record(token_raw, gamma, alpha, common),
+                   **loss_record(raw, gamma, alpha, common), "grad_norm": norm_value, "grad_norm_dtype": norm_dtype,
                    "grad_norm_semantics": "before clipping; native backend norm computation",
                    "clip_threshold": float(train_args.get("max_grad_norm", 1.0)),
                    "clip_factor_nominal": min(1.0, float(train_args.get("max_grad_norm", 1.0)) / (norm_value + 1e-6)) if norm_value else 1.0,
@@ -498,8 +535,10 @@ def train(args, torch, control=None):
                    "optimizer_precision": optimizer_precision(optimizer, torch),
                    "seconds_since_start": time.time() - started}
             if control is not None:
-                row.update(gamma_used=gamma, alpha_used=alpha,
-                           canonical_total=raw["sensitive"] + alpha * (raw["retain"] + raw["common"]))
+                row.update(gamma_used=gamma, alpha_used=alpha, common_used=common,
+                           canonical_total=float(method["gamma"]) * raw["sensitive"] + float(method["alpha"]) * (raw["retain"] + raw["common"]))
+                if hasattr(control, "training_row_metadata"):
+                    row.update(control.training_row_metadata(step))
             append_json(output / "loss_history.jsonl", row)
             manifest["completed_updates"] = step
             atomic_json(output / "manifest.json", manifest)
