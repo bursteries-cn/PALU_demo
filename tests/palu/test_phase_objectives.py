@@ -37,7 +37,7 @@ class ObjectiveTests(unittest.TestCase):
                  ({"sensitive": 5., "retain": 2., "common": 6.},
                   {"sensitive": 1, "retain": 1, "common": 3})]
         totals = {key: sum(counts[key] for _, counts in parts) for key in parts[0][0]}
-        for gamma, alpha, common in ((1, 0, 0), (0, 2, 2), (0, 2, 0), (1, 2, 2)):
+        for gamma, alpha, common in ((1, 0, 0), (1, 0, 2), (0, 2, 2), (0, 2, 0), (1, 2, 2)):
             observed = sum(gradient.weighted_loss(raw, counts, totals,
                 gamma=gamma, alpha=alpha, common=common, normalization="global", accumulation=2, world=1) / 2
                 for raw, counts in parts)
@@ -95,7 +95,7 @@ class GradientTests(unittest.TestCase):
         targets = [{key: torch.arange(count, dtype=torch.float64) + i / 10
                     for key, count in row.items()} for i, row in enumerate(counts)]
         totals = {key: sum(row[key] for row in counts) for key in counts[0]}
-        for coefficients in ((1, 0, 0), (0, 2, 2), (0, 2, 0)):
+        for coefficients in ((1, 0, 0), (1, 0, 2), (0, 2, 2), (0, 2, 0)):
             x = torch.tensor(.7, dtype=torch.float64, requires_grad=True)
             for values, local in zip(targets, counts):
                 raw = {key: ((x - tokens) ** 2).mean() for key, tokens in values.items()}

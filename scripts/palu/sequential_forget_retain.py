@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One continuous PALU F -> R(+common-KL) experiment with frozen inputs."""
+"""One continuous PALU F(+common-KL) -> R(+common-KL) experiment with frozen inputs."""
 import argparse
 import copy
 import json
@@ -15,11 +15,13 @@ from layout_loss_curve_experiment import read_json, read_rows, write_json, sha
 
 
 def protocol(forget_epochs=10, retain_epochs=10, retain_epoch_size=200,
-             learning_rate=1e-5, common_kl=True):
+             learning_rate=1e-5, common_kl=True, forget_common_kl_weight=0.):
     if any(not math.isfinite(v) or v <= 0 for v in (forget_epochs, retain_epochs, learning_rate)):
         raise ValueError('Epoch budgets and learning rate must be finite and positive')
     if retain_epoch_size not in (200, 3800):
         raise ValueError('Retain epoch size must explicitly be 200 or 3800 draws')
+    if not math.isfinite(forget_common_kl_weight) or forget_common_kl_weight < 0:
+        raise ValueError('Forget common-KL weight must be finite and nonnegative')
     f, r = math.ceil(forget_epochs * 200 / 32), math.ceil(retain_epochs * retain_epoch_size / 32)
     return dict(experiment='seed103_sequential_forget_retain', seed=103,
         learning_rate=learning_rate, scheduler='constant', warmup_steps=0,
@@ -29,7 +31,9 @@ def protocol(forget_epochs=10, retain_epochs=10, retain_epoch_size=200,
         forget_draws=f*32, retain_draws=r*32,
         actual_forget_phase_epochs=f*32/200,
         actual_retain_phase_epochs=r*32/retain_epoch_size,
-        phase_weights={'forget': [1., 0., 0.], 'retain': [0., 2., 2. if common_kl else 0.]},
+        phase_weights={'forget': [1., 0., float(forget_common_kl_weight)],
+                       'retain': [0., 2., 2. if common_kl else 0.]},
+        forget_common_kl_weight=float(forget_common_kl_weight),
         common_kl_in_retain=common_kl, effective_batch=32, layout='four',
         microbatch=1, accumulation=8, normalization='global',
         eval_every_epochs=2, evaluation_backend='sharded',
@@ -37,6 +41,13 @@ def protocol(forget_epochs=10, retain_epochs=10, retain_epoch_size=200,
         epoch_semantics='Phase-local sample exposure clock; retain sampling is with replacement, not full coverage',
         switch_policy='Round each phase UP to a complete 32-pair update; never mix phase objectives in one update',
         checkpoint_retention='final only after verified evaluation')
+
+
+def objective_label(plan):
+    def phase(weights):
+        return ' + '.join((name if weight == 1 else f'{weight:g}{name}')
+                         for name, weight in zip(('F', 'R', 'common_KL'), weights) if weight) or '0'
+    return ' -> '.join(phase(plan['phase_weights'][name]) for name in ('forget', 'retain'))
 
 
 def evaluation_events(plan):
@@ -120,7 +131,7 @@ class PhaseControl:
         import layout_token_training as base
         manifest.update(experiment=self.plan['experiment'], model=config['model']['handler'],
             phase_plan=self.plan, branches=0, eval_every_epochs=2,
-            evaluation_backend='sharded', training_objective='F -> 2R + optional 2common_KL')
+            evaluation_backend='sharded', training_objective=objective_label(self.plan))
         if runtime['rank'] == 0:
             base.atomic_json(args.output / 'manifest.json', manifest)
 
@@ -136,11 +147,74 @@ def code_paths():
     return sorted(set(existing() + [Path(__file__),
         ROOT / 'scripts/palu/seed103_token_equal.py',
         ROOT / 'scripts/palu/run_sequential_forget_retain.sh',
+        ROOT / 'scripts/palu/run_sequential_common_kl.sh',
         ROOT / 'scripts/palu/plot_sequential_phases.py',
         ROOT / 'scripts/palu/README_sequential_forget_retain.md']))
 
 
-def prepare(study, source, plan):
+def verify_paired_study(paired, study, plan, config, payload, reference, torch):
+    """Require the same frozen experiment, allowing only first-phase common-KL."""
+    from seed103_token_equal import relocate
+    frozen = paired / 'frozen'
+    manifest = read_json(frozen / 'manifest.json')
+    required = {'config.json', 'schedule.pt', 'retain_reference.json',
+                'epoch_schedule.json', 'pair_schedule.jsonl'}
+    hashes = manifest['frozen_file_sha256']
+    if not required.issubset(hashes):
+        raise ValueError('Paired baseline lacks complete frozen input hashes')
+    for name, digest in hashes.items():
+        if sha(frozen / name) != digest:
+            raise ValueError('Paired baseline frozen input changed: ' + name)
+    baseline_plan = frozen_plan(paired)
+    normalized = []
+    for candidate in (plan, baseline_plan):
+        candidate = copy.deepcopy(candidate)
+        candidate.pop('forget_common_kl_weight', None)  # absent in the original frozen run
+        candidate['phase_weights']['forget'][2] = 0.
+        normalized.append(candidate)
+    if normalized[0] != normalized[1]:
+        raise ValueError('Paired baseline phase plan differs beyond Forget common-KL weight')
+    baseline_config = read_json(frozen / 'config.json')
+    candidate_config = relocate(config, str(study), str(paired))
+    for candidate in (candidate_config, baseline_config):
+        candidate.pop('sequential_phase_plan')
+    if candidate_config != baseline_config:
+        raise ValueError('Paired baseline model, data, training or method configuration differs')
+    if sha(reference) != hashes['retain_reference.json']:
+        raise ValueError('Paired baseline Retain reference differs')
+    events = evaluation_events(plan)
+    if read_json(frozen / 'epoch_schedule.json') != events:
+        raise ValueError('Paired baseline epoch evaluation schedule differs')
+    baseline = torch.load(frozen / 'schedule.pt', map_location='cpu', weights_only=True)
+    keys = ('seed', 'updates', 'effective_batch', 'total_training_pairs', 'data_sizes',
+            'eos_token_id', 'first_n', 'pair_stream_sha256', 'tensor_schedule_sha256',
+            'fixed_dataset_sha256', 'fixed_target_counts', 'collator', 'normalization')
+    if any(payload['metadata'][key] != baseline['metadata'][key] for key in keys):
+        raise ValueError('Paired baseline fixed samples, tokenization or schedule metadata differs')
+    if baseline['metadata']['epoch_evaluation_schedule'] != events:
+        raise ValueError('Paired baseline embedded evaluation schedule differs')
+    if len(baseline['windows']) != plan['total_updates'] or len(payload['windows']) != plan['total_updates']:
+        raise ValueError('Paired baseline does not contain the complete planned schedule')
+    keys = ('step', 'window_sha256', 'pair_sha256', 'pair_records', 'tensor_hashes',
+            'counts', 'sample_lengths', 'global_padding_shapes')
+    for current, original in zip(payload['windows'], baseline['windows']):
+        if any(current[key] != original[key] for key in keys):
+            raise ValueError(f"Paired baseline window or pair order differs at step {current['step']}")
+    pairs = [{'step': window['step'], **pair}
+             for window in payload['windows'] for pair in window['pair_records']]
+    if read_rows(frozen / 'pair_schedule.jsonl') != pairs:
+        raise ValueError('Paired baseline recorded pair order differs')
+    return dict(passed=True, paired_study=str(paired),
+        allowed_difference='Forget-phase common-KL coefficient only',
+        baseline_forget_common_kl_weight=baseline_plan['phase_weights']['forget'][2],
+        forget_common_kl_weight=plan['phase_weights']['forget'][2],
+        matched_updates=len(payload['windows']), matched_pairs=len(pairs),
+        fixed_dataset_sha256=payload['metadata']['fixed_dataset_sha256'],
+        tensor_schedule_sha256=payload['metadata']['tensor_schedule_sha256'],
+        baseline_frozen_file_sha256=hashes)
+
+
+def prepare(study, source, plan, paired_study=None):
     import torch
     from omegaconf import OmegaConf
     from model import get_tokenizer
@@ -195,6 +269,8 @@ def prepare(study, source, plan):
             raise ValueError('Historical prefix changed during schedule extension')
     if payload['metadata']['fixed_dataset_sha256'] != original['metadata']['fixed_dataset_sha256']:
         raise ValueError('Frozen sample pool changed')
+    paired_receipt = (verify_paired_study(paired_study, study, plan, config, payload,
+                      old / 'retain_reference.json', torch) if paired_study is not None else None)
     frozen = study / 'frozen'
     frozen.mkdir(parents=True)
     write_json(frozen / 'config.json', config)
@@ -214,17 +290,23 @@ def prepare(study, source, plan):
     metadata = copy.deepcopy(payload['metadata'])
     metadata['frozen_file_sha256'] = {n: sha(frozen/n) for n in
         ('config.json', 'schedule.pt', 'retain_reference.json', 'epoch_schedule.json', 'pair_schedule.jsonl')}
+    if paired_receipt is not None:
+        metadata['paired_comparison'] = paired_receipt
     write_json(frozen / 'manifest.json', metadata)
     for path in code_paths():
         dest = study / 'code_snapshot' / path.relative_to(ROOT)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, dest)
     write_json(study / 'code_sha256.json', {str(p.relative_to(ROOT)): sha(p) for p in code_paths()})
+    if paired_receipt is not None:
+        write_json(study / 'paired_comparison.json', paired_receipt)
     r_pairs = records[plan['forget_updates']*32:]
     plan.update(status='prepared', source_study=str(source),
         source_frozen_sha256=provenance['frozen_file_sha256'], required_free_bytes=budget,
         retain_phase_unique_retain=len({p['retain_index'] for p in r_pairs}),
         evaluation_steps=[e['step'] for e in events], cuda_initialized=torch.cuda.is_initialized())
+    if paired_receipt is not None:
+        plan['paired_study'] = str(paired_study)
     write_json(study / 'experiment.json', plan)
     print(json.dumps(plan), flush=True)
 
@@ -308,21 +390,26 @@ def main():
     p.add_argument('--mode', choices=('dry-run', 'prepare', 'train', 'analyze', 'plot'), required=True)
     p.add_argument('--study', type=Path, required=True)
     p.add_argument('--source-study', type=Path)
+    p.add_argument('--paired-study', type=Path,
+                   help='Existing sequential study whose complete frozen inputs must match')
     p.add_argument('--forget-epochs', type=float, default=10)
     p.add_argument('--retain-epochs', type=float, default=10)
     p.add_argument('--retain-epoch-size', type=int, choices=(200, 3800), default=200)
     p.add_argument('--learning-rate', type=float, default=1e-5)
     p.add_argument('--no-common-kl', action='store_true')
+    p.add_argument('--forget-common-kl-weight', type=float, default=0.,
+                   help='Common-KL coefficient in Forget phase; default preserves original F-only run')
     args = p.parse_args()
     plan = protocol(args.forget_epochs, args.retain_epochs, args.retain_epoch_size,
-                    args.learning_rate, not args.no_common_kl)
+                    args.learning_rate, not args.no_common_kl, args.forget_common_kl_weight)
     study = args.study.resolve()
     if args.mode == 'dry-run':
         print(json.dumps({**plan, 'evaluation_events': evaluation_events(plan)}, indent=2))
     elif args.mode == 'prepare':
         if args.source_study is None:
             p.error('prepare requires --source-study')
-        prepare(study, args.source_study.resolve(), plan)
+        prepare(study, args.source_study.resolve(), plan,
+                args.paired_study.resolve() if args.paired_study is not None else None)
     elif args.mode == 'train':
         train(study)
     else:

@@ -16,7 +16,9 @@ cd -- "$REPO_ROOT"
 CONTROL="$SCRIPT_DIR/sequential_forget_retain.py"
 ARGS=(--study "$STUDY_DIR" --source-study "$SOURCE_STUDY"
   --forget-epochs "${FORGET_EPOCHS:-10}" --retain-epochs "${RETAIN_EPOCHS:-10}"
-  --retain-epoch-size "${RETAIN_EPOCH_SIZE:-200}" --learning-rate "${LEARNING_RATE:-1e-5}")
+  --retain-epoch-size "${RETAIN_EPOCH_SIZE:-200}" --learning-rate "${LEARNING_RATE:-1e-5}"
+  --forget-common-kl-weight "${FORGET_COMMON_KL_WEIGHT:-0}")
+if [[ -n "${PAIRED_STUDY:-}" ]]; then ARGS+=(--paired-study "$PAIRED_STUDY"); fi
 if [[ "$COMMON_KL" == 0 ]]; then ARGS+=(--no-common-kl)
 elif [[ "$COMMON_KL" != 1 ]]; then printf 'COMMON_KL must be 0 or 1\n' >&2; exit 2; fi
 if [[ "$MODE" == dry-run ]]; then

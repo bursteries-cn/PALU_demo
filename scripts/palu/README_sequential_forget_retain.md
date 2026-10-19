@@ -53,3 +53,20 @@ python scripts/palu/sequential_forget_retain.py --mode plot \
 结束后自动校验并绘图；中途 `--mode plot` 只读取已落盘结果。记录每次更新的三项**原始**损失及实际加权目标；即使某项权重为0也保留其数值，不能把加权零损失当作该能力不再变化。固定全集评估与在线更新前损失分别展示。
 
 分析应同时看FQ、KS距离及高/低TR两侧CDF差、TR分位数、MU与三项原始损失。FQ是KS检验p值，最大化FQ不等于证明知识删除。R恢复阶段也可能恢复目标答案偏好；Adam动量使刚切换时的更新仍受上一阶段影响。此单轨迹实验能展示动态，不能单独区分学习率、训练顺序、训练预算及common-KL的因果贡献。
+
+## 全程 common-KL 的配对对照（2026-10-20）
+
+此前运行 `artifacts/sequential_forget_retain/20261019_205517` 在F-only阶段出现候选概率趋同及生成塌缩。新对照只把第一阶段权重从 `[1,0,0]` 改为 `[1,0,2]`；第二阶段仍为 `[0,2,2]`。从相同原始Full模型重新开始，阶段之间延续本轮Adam状态，**不从之前停止的模型恢复**。
+
+```bash
+MODE=dry-run bash scripts/palu/run_sequential_common_kl.sh
+FOUR_GPUS=0,1,2,3 bash scripts/palu/run_sequential_common_kl.sh
+```
+
+专用启动器固定两个阶段common-KL系数均为2；其余默认仍是seed103、恒定1e-5、无warmup、63+63步、200对曝光/轮、四卡1×累积8、整步token归一化、每2轮及阶段端点评估。输出写入新的 `artifacts/sequential_common_kl/时间戳/`。旧启动器保留F-only默认，避免改变历史命令的含义。
+
+`SOURCE_STUDY` 仍指原60步token等权实验的冻结数据。`PAIRED_STUDY` 默认指上述已停止的126步两阶段计划；prepare会核对原始Full起点、训练配置和阶段设置（仅允许F阶段common-KL系数变化）、全部126个窗口的样本/配对、固定评估数据、Retain参考及评估时点。冻结schedule含计划全部126步，旧训练停止于108步不影响该核验。缺失或不一致时停止准备，不静默改用新配对。dry-run只展示计划，真实资产配对检查在prepare进行。
+
+common-KL是Forget输入非敏感位置上的 `KL(student || Full teacher)`；训练初始学生等于teacher，此项接近0是预期现象。是否启用以 `loss_history.jsonl` 中全程 `common_used=2` 为准。继续记录全部原始损失、实际权重、梯度范数/裁剪比例和逐样本评估；中间权重仍在评估校验后删除，只保留最终模型和完整结果。
+
+基线最后一次完整评估为step100，故严格配对比较仅覆盖0–100步；新实验113/125/126步没有对应旧基线。判定坍缩应联合MU、ROUGE、生成文本多样性和答案NLL，而非只看TR是否集中到1。若新实验保留更好但F损失也较高，还需区分“遗忘变慢”和“相近遗忘程度下得到保护”。本轮只提供seed103这一配置的证据。
