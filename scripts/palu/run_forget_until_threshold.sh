@@ -6,6 +6,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 SOURCE_STUDY="${SOURCE_STUDY:-$REPO_ROOT/artifacts/token_equal_seed103/20261017_192348}"
 STUDY_DIR="${STUDY_DIR:-$REPO_ROOT/artifacts/forget_threshold_light/$(date +%Y%m%d_%H%M%S)}"
 PROBE_INTERVAL="${PROBE_INTERVAL:-epoch}"
+STOPPING_SCOPE="${STOPPING_SCOPE:-global}"
 ZERO_WEIGHT_RETAIN_NO_GRAD="${ZERO_WEIGHT_RETAIN_NO_GRAD:-0}"
 FOUR_GPUS="${FOUR_GPUS:-0,1,2,3}"
 MODE="${MODE:-run}"
@@ -22,6 +23,12 @@ fi
 if [[ "$ZERO_WEIGHT_RETAIN_NO_GRAD" != 0 && "$ZERO_WEIGHT_RETAIN_NO_GRAD" != 1 ]]; then
   printf 'ZERO_WEIGHT_RETAIN_NO_GRAD must be 0 or 1\n' >&2; exit 2
 fi
+if [[ "$STOPPING_SCOPE" != global && "$STOPPING_SCOPE" != sample_permanent ]]; then
+  printf 'STOPPING_SCOPE must be global or sample_permanent\n' >&2; exit 2
+fi
+if [[ "$STOPPING_SCOPE" == sample_permanent && ( "$PROBE_INTERVAL" != epoch || "${THRESHOLD_COMPARISON:-lt}" != lt ) ]]; then
+  printf 'sample_permanent requires PROBE_INTERVAL=epoch and THRESHOLD_COMPARISON=lt\n' >&2; exit 2
+fi
 if [[ ${#SEED_LIST[@]} == 0 ]]; then printf 'SEEDS must not be empty\n' >&2; exit 2; fi
 # Fail before preparing any seed if the list is malformed or repeats an output.
 SEEN=" "
@@ -37,6 +44,7 @@ fi
 printf 'Sequential seeds: %s; GPUs: %s; threshold probes: %s; no retain stage will run.\n' "${SEED_LIST[*]}" "$FOUR_GPUS" "$PROBE_INTERVAL"
 printf 'Evaluation: F200 F+KL each probe; FQ/TR initially and every 2 epochs; MU once at Forget stop.\n'
 printf 'Zero-weight Retain no-grad opt-in: %s (frozen into each new plan).\n' "$ZERO_WEIGHT_RETAIN_NO_GRAD"
+printf 'Stopping scope: %s; learning rate: %s.\n' "$STOPPING_SCOPE" "${LEARNING_RATE:-1e-5}"
 "$PYTHON_BIN" -S - "${SEED_LIST[@]}" <<'PY'
 import sys
 seeds = [int(value) for value in sys.argv[1:]]
@@ -52,7 +60,7 @@ for seed in "${SEED_LIST[@]}"; do
   ARGS=(--study "$SEED_STUDY" --source-study "$SOURCE_STUDY" --seed "$seed"
     --threshold-low "${THRESHOLD_LOW:-0.4}" --threshold-high "${THRESHOLD_HIGH:-0.5}"
     --max-updates "${MAX_UPDATES:-63}" --learning-rate "${LEARNING_RATE:-1e-5}"
-    --probe-interval "$PROBE_INTERVAL")
+    --probe-interval "$PROBE_INTERVAL" --stopping-scope "$STOPPING_SCOPE")
   if [[ "$ZERO_WEIGHT_RETAIN_NO_GRAD" == 1 ]]; then
     ARGS+=(--zero-weight-retain-no-grad)
   fi

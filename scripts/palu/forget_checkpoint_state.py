@@ -18,6 +18,20 @@ IDENTITY_KEYS = ("config_sha256", "schedule_sha256",
                  "initial_parameter_sha256", "teacher_parameter_sha256")
 
 
+def sample_stop_state_fields(container):
+    """Copy and authenticate optional controller state without changing old runs."""
+    keys = ("sample_stop_state", "sample_stop_state_sha256")
+    if not any(key in container for key in keys):
+        return {}
+    from prepare_layout_schedule import canonical_sha
+    if (not all(key in container for key in keys)
+            or not isinstance(container["sample_stop_state"], dict)
+            or canonical_sha(container["sample_stop_state"]) != container["sample_stop_state_sha256"]):
+        raise ValueError("Sample stopping state is missing or differs from its canonical SHA256")
+    # Do not let subsequent in-memory controller updates mutate saved client state.
+    return json.loads(json.dumps({key: container[key] for key in keys}, allow_nan=False))
+
+
 @contextmanager
 def _evaluation_state(runtime, torch):
     rng = state.capture_rng(runtime, torch)
@@ -148,6 +162,7 @@ def _broadcast_error(error, runtime, torch):
 
 def validate_resume_files(folder, receipt):
     """Validate every owned restart file before full native deserialization."""
+    sample_stop_state_fields(receipt)
     folder = Path(folder)
     if folder.is_symlink() or not folder.is_dir():
         raise ValueError("Missing owned restart checkpoint directory")
@@ -198,6 +213,7 @@ def save_resume_checkpoint(folder, runtime, manifest, step, torch, *,
     client = {key: manifest[key] for key in IDENTITY_KEYS}
     client.update(step=step, completed_updates=step, consumed_pairs=step * 32,
                   next_update=step + 1)
+    client.update(sample_stop_state_fields(manifest))
     error = None
     if rank == 0:
         try:
@@ -254,6 +270,10 @@ def load_resume_checkpoint(folder, runtime, manifest, torch):
         raise ValueError("Restart folder cannot be a symlink")
     folder = folder.resolve()
     receipt = json.loads((folder / "receipt.json").read_text())
+    controller_state = sample_stop_state_fields(receipt)
+    expected_controller_state = sample_stop_state_fields(manifest)
+    if expected_controller_state and expected_controller_state != controller_state:
+        raise ValueError("Restart and current sample stopping state differ")
     if (runtime["world"] != 4 or not runtime["distributed"]
             or runtime["accumulation"] != 8 or int(runtime["engine"].global_steps) != 0):
         raise ValueError("Restore requires a fresh four-rank accumulation-eight engine")
@@ -270,9 +290,10 @@ def load_resume_checkpoint(folder, runtime, manifest, torch):
         path, client = runtime["engine"].load_checkpoint(str(folder), tag=receipt["tag"],
             load_module_strict=True, load_optimizer_states=True,
             load_lr_scheduler_states=True, load_module_only=False)
-    if not path or any(client.get(key) != receipt[key]
+    if (not path or sample_stop_state_fields(client) != controller_state
+            or any(client.get(key) != receipt[key]
                        for key in (*IDENTITY_KEYS, "step", "completed_updates",
-                                   "consumed_pairs", "next_update")):
+                                   "consumed_pairs", "next_update", *controller_state))):
         raise ValueError("DeepSpeed did not restore the complete expected restart state")
     sidecar = folder / f"rank-{runtime['rank']}.pt"
     # As in the existing fork loader, only an owned, hash-validated sidecar is read.

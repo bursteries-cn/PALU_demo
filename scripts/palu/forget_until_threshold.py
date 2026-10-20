@@ -39,9 +39,36 @@ def probe_steps(plan):
     return result
 
 
+def validate_stopping_policy(plan):
+    """Old plans omit stopping_scope and keep the original global criterion."""
+    scope = plan.get("stopping_scope", "global")
+    if scope not in ("global", "sample_permanent"):
+        raise ValueError("stopping_scope must be global or sample_permanent")
+    if scope == "sample_permanent":
+        required = dict(probe_interval="epoch", threshold_comparison="lt",
+                        evaluation_policy="forget_light_v1")
+        if any(plan.get(key) != value for key, value in required.items()):
+            raise ValueError("sample_permanent requires epoch probes, strict lt and forget_light_v1")
+        if plan.get("sample_stop_policy") != sample_stop_policy():
+            raise ValueError("Frozen sample_stop_policy differs from the supported permanent policy")
+    return scope
+
+
+def sample_stop_policy():
+    return dict(loss="per_sample_sensitive_token_mean", comparison="lt",
+        permanence="permanent", apply_after="completed_update_epoch_probe",
+        common_kl="all_samples_unchanged",
+        denominator="original_whole_update_sensitive_tokens_including_inactive",
+        zero_sensitive_token_samples="excluded_from_eligibility_not_threshold_hits",
+        terminal="all_eligible_deactivated_or_budget",
+        low_boundary="diagnostic_only_no_reactivation_or_upward_correction",
+        retain_reference_feedback=False,
+        shared_parameter_drift="continue_probing_inactive_samples_without_reactivation")
+
+
 def protocol(seed=103, threshold_low=.4, threshold_high=.5, max_updates=63,
              learning_rate=1e-5, probe_interval="epoch", threshold_comparison=None,
-             zero_weight_retain_no_grad=False):
+             zero_weight_retain_no_grad=False, stopping_scope="global"):
     if type(zero_weight_retain_no_grad) is not bool:
         raise ValueError("zero_weight_retain_no_grad must be boolean")
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
@@ -59,6 +86,7 @@ def protocol(seed=103, threshold_low=.4, threshold_high=.5, max_updates=63,
         raise ValueError("threshold_comparison must be lt or le")
     sign = "<" if comparison == "lt" else "<="
     plan = dict(experiment="palu_forget_until_threshold", seed=seed,
+        stopping_scope=stopping_scope,
         threshold_low=float(threshold_low), threshold_high=float(threshold_high),
         learning_rate=learning_rate, scheduler="constant", warmup_steps=0,
         max_updates=max_updates, total_updates=max_updates, forget_updates=max_updates,
@@ -83,6 +111,13 @@ def protocol(seed=103, threshold_low=.4, threshold_high=.5, max_updates=63,
         schedule_origin=("historical_seed103_first_60_updates_then_recorded_extension"
                          if seed == 103 else "fresh_independent_torch_generators_for_F_permutation_and_R_replacement"),
         seed_comparison_note="103 is the historical-pair anchor; 104+ use the recorded fresh sampler, not a replay of seed103")
+    if stopping_scope == "sample_permanent":
+        plan.update(experiment="palu_sample_forget_until_threshold",
+            sample_stop_policy=sample_stop_policy(),
+            probe_loss="post-update raw PALU F on every fixed F200 sample; each sample's sensitive-token mean",
+            stop_policy="After each scheduled epoch probe, permanently deactivate F for eligible samples with F < upper threshold; stop training when all eligible samples are inactive",
+            budget_exhaustion_policy="Save and evaluate the last complete update; report remaining active samples; do not infer per-sample hits from the global mean")
+    validate_stopping_policy(plan)
     plan["probe_steps"] = probe_steps(plan)
     return plan
 
@@ -155,7 +190,8 @@ def code_paths():
     from sequential_forget_retain import code_paths as existing
     return sorted(set(existing() + [ROOT / "scripts/palu" / name for name in
         ("forget_until_threshold.py", "forget_threshold_control.py", "forget_checkpoint_state.py",
-         "forget_light_evaluation.py", "run_forget_until_threshold.sh", "README_forget_until_threshold.md")]))
+         "forget_light_evaluation.py", "run_forget_until_threshold.sh", "README_forget_until_threshold.md",
+         "sample_forget_control.py", "run_sample_forget_threshold.sh", "README_sample_forget_threshold.md")]))
 
 
 def prepare(study, source, plan):
@@ -252,6 +288,7 @@ def frozen_plan(study):
         raise ValueError("Frozen zero_weight_retain_no_grad must be boolean")
     if plan.get("threshold_comparison", "le") not in ("lt", "le"):
         raise ValueError("Frozen threshold_comparison must be lt or le")
+    validate_stopping_policy(plan)
     return plan
 
 
@@ -266,19 +303,24 @@ def train(study):
         if sha(ROOT / name) != digest:
             raise ValueError("Prepared code changed: " + name)
     plan = frozen_plan(study)
+    if plan.get("stopping_scope", "global") == "sample_permanent":
+        from sample_forget_control import SampleForgetControl
+        control = SampleForgetControl(plan)
+    else:
+        control = ForgetThresholdControl(plan)
     args = argparse.Namespace(config=study/"frozen/config.json", schedule=study/"frozen/schedule.pt",
         output=study/"run", max_updates=None, layout="four", seed=plan["seed"],
         normalization="global", padding_scope="microbatch", online_evaluation=True,
         delete_evaluated_intermediate=True, eval_every_epochs=2, eval_backend="sharded")
     try:
-        base.train(args, torch, ForgetThresholdControl(plan))
+        base.train(args, torch, control)
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 
 
 def analyze(study, validate_completed=True):
-    frozen_plan(study)
+    plan = frozen_plan(study)
     if validate_completed:
         from forget_threshold_control import validate
         validate(study)
@@ -290,7 +332,19 @@ def analyze(study, validate_completed=True):
         report.update(status="forget_stage_complete_awaiting_retention_choice" if validate_completed else "stop_observation_available",
                       stop_decision=stop, planned_retain_updates=0)
     report["forget_to_retain_switch_step"] = None
+    report["stopping_scope"] = plan.get("stopping_scope", "global")
     write_json(study / "analysis/analysis_manifest.json", report)
+    stopping_description = (
+        "The stopping unit is one eligible Forget sample. At each scheduled epoch probe, "
+        "F < upper threshold permanently disables that sample's F term; its common-KL remains active. "
+        "The whole-update sensitive-token denominator still includes inactive samples. "
+        "Zero-sensitive-token samples are excluded from eligibility, not counted as hits. "
+        "Training stops when all eligible samples are inactive or the update budget is exhausted. "
+        "A low global average does not trigger stopping. Shared parameters can move an inactive "
+        "sample outside the interval later; probes record this drift without reactivation.\n"
+        if report["stopping_scope"] == "sample_permanent" else
+        "The global fixed-F200 sensitive-token mean is the stopping statistic; "
+        "a threshold hit does not mean every sample reached the interval.\n")
     (study / "analysis/README.md").write_text(
         "# Forget-only threshold experiment\n\n"
         "This run does not enter any retain-training stage. `stop_decision.json` records "
@@ -307,7 +361,8 @@ def analyze(study, validate_completed=True):
         "Light evaluation reuses same-step F/KL probes and preserves their per-example records. "
         "The frozen plan records probe_interval, probe_steps and the threshold comparison; "
         "old plans without these fields retain their every-update, <= behavior. "
-        "The lower boundary is only an overshoot diagnostic, not an additional stopping condition.\n")
+        "The lower boundary is only an overshoot diagnostic, not an additional stopping condition.\n\n"
+        + stopping_description)
     return report
 
 
@@ -325,6 +380,7 @@ def parser():
     result.add_argument("--learning-rate", type=float)
     result.add_argument("--probe-interval", choices=("epoch", "update"))
     result.add_argument("--threshold-comparison", choices=("lt", "le"))
+    result.add_argument("--stopping-scope", choices=("global", "sample_permanent"))
     result.add_argument("--zero-weight-retain-no-grad", action="store_true", default=None,
                         help="Explicit future-plan opt-in after GPU equivalence validation; never changes an existing plan")
     return result
@@ -335,7 +391,7 @@ def main():
     args = p.parse_args()
     controls = {name: getattr(args, name) for name in
                 ("seed", "threshold_low", "threshold_high", "max_updates", "learning_rate",
-                 "probe_interval", "threshold_comparison", "zero_weight_retain_no_grad")
+                 "probe_interval", "threshold_comparison", "zero_weight_retain_no_grad", "stopping_scope")
                 if getattr(args, name) is not None}
     if args.mode not in ("prepare", "dry-run") and (controls or args.source_study is not None):
         p.error("train/analyze/export use the frozen plan; do not pass preparation settings")

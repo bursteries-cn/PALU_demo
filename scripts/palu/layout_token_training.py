@@ -155,6 +155,34 @@ def after_complete_update(control, runtime, manifest, config, schedule, args, st
     return stop
 
 
+def microbatch_forget_weight(control, window, indices):
+    """Sample stopping is explicitly restricted to the validated b1 layout."""
+    if control is None or not hasattr(control, "forget_weight"):
+        return 1.0
+    if len(indices) != 1:
+        raise ValueError("Sample stopping requires exactly one sample per rank microbatch")
+    value = control.forget_weight(window["pair_records"][indices[0]]["forget_index"])
+    if type(value) not in (int, float) or value not in (0, 1):
+        raise ValueError("Sample Forget weight must be binary")
+    return float(value)
+
+
+def masked_objective_record(row, micros, gamma, alpha, common):
+    """Keep raw losses unmasked while reporting the objective actually optimized."""
+    total = row["global_target_counts"]["sensitive"]
+    active_tokens = sum(m["counts"]["sensitive"] * m["sample_forget_weight"] for m in micros)
+    masked = sum(m["raw"]["sensitive"] * m["counts"]["sensitive"] * m["sample_forget_weight"]
+                 for m in micros) / total
+    for item in (row, row["window_token_mean"]):
+        item["unmasked_objective_loss"] = gamma * item["raw_sensitive_loss"] + alpha * item["raw_retain_nll"] + common * item["raw_common_kl"]
+        item["masked_sensitive_loss"] = masked
+        item["loss_forget"] = gamma * masked
+        item["loss"] = item["loss_total"] = gamma * masked + alpha * item["raw_retain_nll"] + common * item["raw_common_kl"]
+    row.update(active_sensitive_tokens_in_update=int(active_tokens),
+               active_sensitive_token_fraction=active_tokens / total,
+               sample_mask_denominator="original_whole_update_sensitive_tokens_including_inactive")
+
+
 def optimizer_groups(model, train_args):
     from transformers.trainer_pt_utils import get_parameter_names
     from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
@@ -481,11 +509,12 @@ def train(args, torch, control=None):
             indices = [microstep * world + rank] if distributed else list(range(microstep * 8, (microstep + 1) * 8))
             inputs = microbatch_inputs(window, indices, device, args.padding_scope)
             local = gradient.target_counts(inputs, tokenizer.eos_token_id, int(method["first_n"]), torch)
+            forget_weight = microbatch_forget_weight(control, window, indices)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 components = gradient.raw_components(engine, reference, inputs, top_k=int(method["top_k"]),
                            first_n=int(method["first_n"]), eos=tokenizer.eos_token_id, torch=torch,
                            retain_requires_grad=retain_policy["retain_requires_grad"])
-                loss = gradient.weighted_loss(components, local, counts, gamma=gamma, alpha=alpha,
+                loss = gradient.weighted_loss(components, local, counts, gamma=gamma * forget_weight, alpha=alpha,
                                common=common, normalization=args.normalization, accumulation=accumulation, world=world)
             if not bool(torch.isfinite(loss.detach())):
                 raise AssertionError(f"Nonfinite loss at update {step}")
@@ -498,6 +527,9 @@ def train(args, torch, control=None):
                                   "raw": {key: float(value.detach()) for key, value in components.items()},
                                   "input_shapes": {split: list(inputs[split]["input_ids"].shape) for split in inputs},
                                   "scaled_forward_loss": float(loss.detach())})
+            if control is not None and hasattr(control, "forget_weight"):
+                micro_records[-1].update(sample_forget_weight=forget_weight,
+                    forget_dataset_index=window["pair_records"][indices[0]]["forget_index"])
             if distributed:
                 engine.backward(loss)
                 if microstep < accumulation - 1:
@@ -578,6 +610,8 @@ def train(args, torch, control=None):
                            canonical_total=float(method["gamma"]) * raw["sensitive"] + float(method["alpha"]) * (raw["retain"] + raw["common"]))
                 if hasattr(control, "training_row_metadata"):
                     row.update(control.training_row_metadata(step))
+                if hasattr(control, "forget_weight"):
+                    masked_objective_record(row, micros, gamma, alpha, common)
             append_json(output / "loss_history.jsonl", row)
             manifest["completed_updates"] = step
             atomic_json(output / "manifest.json", manifest)

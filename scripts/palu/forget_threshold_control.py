@@ -51,6 +51,10 @@ def validate_resume_identity(receipt, manifest, step):
     expected.update({key: manifest[key] for key in IDENTITY_KEYS})
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise ValueError("Native checkpoint does not match this experiment's stopping state")
+    if manifest.get("threshold_plan", {}).get("stopping_scope") == "sample_permanent":
+        for key in ("sample_stop_state", "sample_stop_state_sha256"):
+            if key not in manifest or receipt.get(key) != manifest[key]:
+                raise ValueError("Native checkpoint lost the sample stopping state")
 
 
 class ForgetThresholdControl:
@@ -91,6 +95,10 @@ class ForgetThresholdControl:
         from forget_until_threshold import evaluation_events
         online.events = {r["consumed_pairs"]: r for r in evaluation_events(self.plan)}
 
+    def process_probe(self, step, runtime, manifest, args, torch):
+        """Global stopping remains the default; sample control overrides only this decision."""
+        return stop_decision(step, float(self.last_probe["raw_sensitive_loss"]), self.plan)
+
     def after_update(self, runtime, manifest, config, schedule, args, step, online, torch):
         from forget_checkpoint_state import fixed_forget_probe
         if online is None or step != self._next_update_step or self.decision is not None:
@@ -104,7 +112,7 @@ class ForgetThresholdControl:
         if light:
             online.fixed_forget_probe_result = (step, self.last_probe)
         loss = float(self.last_probe["raw_sensitive_loss"])
-        self.decision = stop_decision(step, loss, self.plan)
+        self.decision = self.process_probe(step, runtime, manifest, args, torch)
         row = dict({k: v for k, v in self.last_probe.items() if k != "fixed_loss_samples"},
                    step=step, measurement="post-update fixed Forget token mean",
                    seed=self.plan["seed"], consumed_pairs=step * 32, pending_pairs=0,
@@ -113,12 +121,15 @@ class ForgetThresholdControl:
                    threshold_low=self.plan["threshold_low"], threshold_high=self.plan["threshold_high"],
                    band_hit=self.plan["threshold_low"] <= loss and threshold_reached(loss, self.plan),
                    stop_reason=self.decision["stop_reason"] if self.decision else None)
+        if self.plan.get("stopping_scope") == "sample_permanent":
+            row["aggregate_in_band_diagnostic"] = row.pop("band_hit")
         if runtime["rank"] == 0:
             for sample in self.last_probe.get("fixed_loss_samples", []):
                 base.append_json(args.output / "forget_probe_samples.jsonl",
                                  dict(sample, step=step, epoch=step * 32 / 200))
             base.append_json(args.output / "forget_probe_history.jsonl", row)
-            print(__import__("json").dumps({"event": "fixed_forget_probe", **row}), flush=True)
+            print(__import__("json").dumps({"event": "fixed_forget_probe",
+                **{k: v for k, v in row.items() if k != "sample_stop_state"}}), flush=True)
         if self.decision is None:
             return False
         # This happens before OnlineEpochEvaluation saves/prunes this state.
@@ -210,7 +221,8 @@ def validate(study):
     step = decision["step"]
     if manifest["status"] != "completed" or manifest["completed_updates"] != step:
         raise ValueError("Forget experiment has not completed")
-    if decision != stop_decision(step, decision["raw_sensitive_loss"], plan):
+    sample_mode = plan.get("stopping_scope", "global") == "sample_permanent"
+    if not sample_mode and decision != stop_decision(step, decision["raw_sensitive_loss"], plan):
         raise ValueError("Recorded stopping reason does not match the measured threshold")
     losses = read_rows(run / "loss_history.jsonl")
     probes = read_rows(run / "forget_probe_history.jsonl")
@@ -236,7 +248,10 @@ def validate(study):
             raise ValueError("Forget objective changed")
         if any(not math.isclose(lr, plan["learning_rate"], rel_tol=1e-10) for lr in row["lr_before"] + row["lr_after"]):
             raise ValueError("Learning rate changed")
-    if any(threshold_reached(r["raw_sensitive_loss"], plan) for r in probes[:-1]):
+    if sample_mode:
+        from sample_forget_control import validate_sample_run
+        validate_sample_run(run, manifest, plan, losses, probes, decision)
+    elif any(threshold_reached(r["raw_sensitive_loss"], plan) for r in probes[:-1]):
         raise ValueError("Training continued after an earlier threshold crossing")
     if probes[-1]["raw_sensitive_loss"] != decision["raw_sensitive_loss"]:
         raise ValueError("Last fixed probe differs from stopping decision")
@@ -267,5 +282,10 @@ def validate(study):
                   band_hit=decision["band_hit"], actual_final_loss=decision["raw_sensitive_loss"],
                   evaluation_steps=expected_steps, native_checkpoint_saved=True,
                   resume_restore_validated=False, continuation_policy="not chosen")
+    if sample_mode:
+        result.update(stopping_scope="sample_permanent", sample_stop_state_sha256=manifest["sample_stop_state_sha256"],
+                      sample_stop_summary=probes[-1]["sample_stop_summary"],
+                      threshold_reached_semantics=decision["threshold_reached_semantics"],
+                      band_hit_semantics=decision["band_hit_semantics"])
     write_json(study / "completion_validation.json", result)
     return result
