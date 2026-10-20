@@ -128,6 +128,78 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(pickle.dumps(actual["numpy"]), pickle.dumps(expected["numpy"]))
         self.assertTrue(self.torch.equal(actual["torch_cpu"], expected["torch_cpu"]))
 
+    def test_common_probe_reuses_forwards_and_matches_native_token_weighting(self):
+        torch = self.torch
+        # Include unequal common counts, zero-common and zero-sensitive examples.
+        self.schedule["samples"]["forget"].append(dict(
+            input_ids=torch.tensor([1, 2, 3, 4]),
+            labels=torch.tensor([-100, -200, -200, 4])))
+        self.schedule["metadata"]["fixed_target_counts"]["common"] = 3
+        with torch.no_grad():
+            self.teacher.weight.mul_(torch.tensor([.95, 1.05, .99, 1.01, 1.02]))
+        for dtype in (torch.float64, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self.model.to(dtype)
+                self.teacher.to(dtype)
+                self.model.calls.clear()
+                self.teacher.calls.clear()
+                rng = checkpoint.state.capture_rng(self.runtime, torch)
+                row = checkpoint.fixed_forget_probe(self.runtime, self.schedule,
+                    self.method, torch, include_common_kl=True)
+                self.assert_rng_equal(checkpoint.state.capture_rng(self.runtime, torch), rng)
+                self.assertTrue(self.model.training)
+                self.assertFalse(self.model.dropout.training)
+                self.assertFalse(self.teacher.training)
+                self.assertTrue(all(parameter.grad is None for parameter in self.model.parameters()))
+                self.assertEqual(len(self.model.calls), 3)
+                self.assertEqual(len(self.teacher.calls), 3)
+                self.assertEqual(row["sensitive_token_count"], 4)
+                self.assertEqual(row["common_token_count"], 3)
+                self.assertEqual(row["forget_zero_common_examples"], 1)
+                self.assertEqual(row["forget_zero_sensitive_examples"], 1)
+                expected_common = expected_sensitive = 0.0
+                expected_common_macro = 0.0
+                with checkpoint._evaluation_state(self.runtime, torch):
+                    for index, sample in enumerate(self.schedule["samples"]["forget"]):
+                        inputs = {key: value.unsqueeze(0) for key, value in sample.items()}
+                        inputs["attention_mask"] = inputs["input_ids"].ne(0)
+                        paired = dict(forget=inputs, retain={**inputs,
+                            "labels": inputs["input_ids"].clamp(max=4)})
+                        native = checkpoint.gradient.raw_components(self.model, self.teacher,
+                            paired, top_k=3, first_n=3, eos=4, torch=torch)
+                        recorded = row["fixed_loss_samples"][index]
+                        self.assertEqual(recorded["dataset_index"], index)
+                        self.assertEqual(recorded["split"], "forget")
+                        self.assertIsNone(recorded["raw_retain_nll"])
+                        self.assertIsNone(recorded["retain_token_count"])
+                        self.assertEqual(recorded["raw_sensitive_loss"], float(native["sensitive"].double()))
+                        self.assertEqual(recorded["raw_common_kl"], float(native["common"].double()))
+                        expected_sensitive += recorded["raw_sensitive_loss"] * recorded["sensitive_token_count"]
+                        expected_common += recorded["raw_common_kl"] * recorded["common_token_count"]
+                        expected_common_macro += recorded["raw_common_kl"]
+                self.assertEqual(row["raw_sensitive_loss"], expected_sensitive / 4)
+                self.assertEqual(row["raw_common_kl"], expected_common / 3)
+                self.assertEqual(row["sample_mean_raw_common_kl"], expected_common_macro / 3)
+
+    def test_common_probe_handles_zero_targets_and_checks_frozen_count(self):
+        torch = self.torch
+        self.schedule["metadata"]["fixed_target_counts"]["common"] = 2
+        with self.assertRaisesRegex(ValueError, "common target count"):
+            checkpoint.fixed_forget_probe(self.runtime, self.schedule,
+                self.method, torch, include_common_kl=True)
+        for sample in self.schedule["samples"]["forget"]:
+            sample["labels"][sample["labels"] == -200] = -100
+        self.schedule["metadata"]["fixed_target_counts"]["common"] = 0
+        row = checkpoint.fixed_forget_probe(self.runtime, self.schedule,
+            self.method, torch, include_common_kl=True)
+        self.assertEqual(row["raw_common_kl"], 0)
+        self.assertEqual(row["common_token_count"], 0)
+        self.assertEqual(row["forget_zero_common_examples"], 2)
+        self.assertTrue(all(sample["raw_common_kl"] == 0 for sample in row["fixed_loss_samples"]))
+        legacy = checkpoint.fixed_forget_probe(self.runtime, self.schedule, self.method, torch)
+        self.assertNotIn("raw_common_kl", legacy)
+        self.assertNotIn("fixed_loss_samples", legacy)
+
     def test_error_restores_rng_and_modes(self):
         torch = self.torch
         before = checkpoint.state.capture_rng(self.runtime, torch)

@@ -4,7 +4,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 SOURCE_STUDY="${SOURCE_STUDY:-$REPO_ROOT/artifacts/token_equal_seed103/20261017_192348}"
-STUDY_DIR="${STUDY_DIR:-$REPO_ROOT/artifacts/forget_threshold_epoch/$(date +%Y%m%d_%H%M%S)}"
+STUDY_DIR="${STUDY_DIR:-$REPO_ROOT/artifacts/forget_threshold_light/$(date +%Y%m%d_%H%M%S)}"
 PROBE_INTERVAL="${PROBE_INTERVAL:-epoch}"
 FOUR_GPUS="${FOUR_GPUS:-0,1,2,3}"
 MODE="${MODE:-run}"
@@ -31,6 +31,7 @@ if [[ "$MODE" == run && -e "$STUDY_DIR" ]]; then
   printf 'Choose a fresh STUDY_DIR; refusing to overwrite %s\n' "$STUDY_DIR" >&2; exit 2
 fi
 printf 'Sequential seeds: %s; GPUs: %s; threshold probes: %s; no retain stage will run.\n' "${SEED_LIST[*]}" "$FOUR_GPUS" "$PROBE_INTERVAL"
+printf 'Evaluation: F200 F+KL each probe; FQ/TR initially and every 2 epochs; MU once at Forget stop.\n'
 "$PYTHON_BIN" -S - "${SEED_LIST[@]}" <<'PY'
 import sys
 seeds = [int(value) for value in sys.argv[1:]]

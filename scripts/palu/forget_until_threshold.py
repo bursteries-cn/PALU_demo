@@ -72,7 +72,8 @@ def protocol(seed=103, threshold_low=.4, threshold_high=.5, max_updates=63,
         stop_policy=f"First scheduled probe with fixed F {sign} upper threshold; lower threshold classifies overshoot only",
         budget_exhaustion_policy="Save and evaluate the last complete update; mark threshold not reached",
         evaluation_backend="sharded", eval_every_epochs=2,
-        evaluation_policy="Initial, first complete update at/after every two F200 exposure epochs, and stop point",
+        evaluation_policy="forget_light_v1",
+        evaluation_policy_description="Initial/2-epoch FQ and TR; MU once at Forget stop; fixed F200 F+KL only, reuse same-step probes",
         checkpoint_retention="Delete verified intermediate evaluation weights; preserve stop model and native optimizer/RNG restart",
         next_stage="Undecided: do not execute A, B or C",
         schedule_origin=("historical_seed103_first_60_updates_then_recorded_extension"
@@ -150,7 +151,7 @@ def code_paths():
     from sequential_forget_retain import code_paths as existing
     return sorted(set(existing() + [ROOT / "scripts/palu" / name for name in
         ("forget_until_threshold.py", "forget_threshold_control.py", "forget_checkpoint_state.py",
-         "run_forget_until_threshold.sh", "README_forget_until_threshold.md")]))
+         "forget_light_evaluation.py", "run_forget_until_threshold.sh", "README_forget_until_threshold.md")]))
 
 
 def prepare(study, source, plan):
@@ -290,11 +291,14 @@ def analyze(study, validate_completed=True):
         "threshold hit, overshoot or exhausted update budget; `completion_validation.json` "
         "checks the saved model and native state inventory, not a GPU save/restore round trip. "
         "A budget stop is not a threshold hit.\n\n"
-        "`evaluation_summary.csv` contains native FQ/MU and raw fixed F/R/common-KL losses; "
+        "`evaluation_summary.csv` contains native FQ/MU and measured fixed losses. "
+        "For forget_light_v1, fixed R is unmeasured and MU is measured only at the Forget endpoint; "
+        "missing measurements remain null/blank, never zero. "
         "`truth_ratio_samples.csv` and `ecdf_points.csv` preserve all evaluated sample IDs. "
         "TR uses geometric wrong-answer probability divided by correct-answer probability "
         "plus 1e-10. `D_low`/`D_high` describe empirical CDF differences, not proof of deletion.\n\n"
         "The scheduled fixed F200 threshold probes are separate from online minibatch losses. "
+        "Light evaluation reuses same-step F/KL probes and preserves their per-example records. "
         "The frozen plan records probe_interval, probe_steps and the threshold comparison; "
         "old plans without these fields retain their every-update, <= behavior. "
         "The lower boundary is only an overshoot diagnostic, not an additional stopping condition.\n")

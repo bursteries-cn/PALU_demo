@@ -16,6 +16,8 @@ import json
 import math
 from pathlib import Path
 
+from checkpoint_retention import observation_scope
+
 EPSILON = 1e-10
 LOSS_FIELDS = ("raw_sensitive_loss", "raw_retain_nll", "raw_common_kl")
 QUANTILES = (("q10", .1), ("q25", .25), ("q50", .5), ("q75", .75), ("q90", .9))
@@ -178,6 +180,8 @@ def phase_epoch_at(step, experiment):
 
 
 def native_metric(payload, key):
+    if key not in payload:
+        raise ValueError(f"Missing required native metric: {key}")
     value = payload[key]
     return finite_number(value["agg_value"] if isinstance(value, dict) else value, "native " + key)
 
@@ -185,6 +189,11 @@ def native_metric(payload, key):
 def collect(study):
     study = Path(study)
     experiment = read_json(study / "experiment.json")
+    manifest_path = study / "run/manifest.json"
+    manifest = read_json(manifest_path) if manifest_path.exists() else {}
+    policies = (experiment.get("evaluation_policy"), manifest.get("threshold_plan", {}).get("evaluation_policy"))
+    if "forget_light_v1" in policies and policies[0] != policies[1]:
+        raise ValueError("Experiment and run manifest disagree on the evaluation policy")
     reference_path = study / "frozen/retain_reference.json"
     reference = load_truth_ratios(read_json(reference_path))
     reference_sha = hashlib.sha256(reference_path.read_bytes()).hexdigest()
@@ -203,6 +212,7 @@ def collect(study):
         if not (evaluation / "TOFU_EVAL.json").is_file() and row.get("evaluation_dir"):
             evaluation = Path(row["evaluation_dir"])
         payload = read_json(evaluation / "TOFU_EVAL.json")
+        metrics, forget_only = observation_scope(row, manifest)
         current = load_truth_ratios(payload)
         if set(current) != set(reference):
             raise ValueError(f"Run/Retain sample IDs differ at step {step}; no inner-join dropping is allowed")
@@ -212,11 +222,13 @@ def collect(study):
             actual_data_epochs=row.get("actual_data_epochs", row.get("epoch")),
             training_phase_recorded=row.get("training_phase", ""))
         for key in ("forget_quality", "model_utility", "ks_d") + LOSS_FIELDS:
-            summary[key] = finite_number(row[key], f"step {step}: {key}")
+            omitted = (key == "model_utility" and key not in metrics) or (key == "raw_retain_nll" and forget_only)
+            summary[key] = None if omitted else finite_number(row[key], f"step {step}: {key}")
+        summary.update(evaluation_metrics=metrics, fixed_loss_scope="forget_only" if forget_only else "full")
         for key in ("forget_quality", "model_utility", "ks_d"):
-            if not 0 <= summary[key] <= 1:
+            if summary[key] is not None and not 0 <= summary[key] <= 1:
                 raise ValueError(f"Out-of-range {key} at step {step}")
-        for key in ("forget_quality", "model_utility"):
+        for key in metrics:
             close(summary[key], native_metric(payload, key), f"step {step}: cached {key}", atol=0)
         diagnostic = signed_ks([item["truth_ratio"] for item in current.values()],
                                [item["truth_ratio"] for item in reference.values()])
@@ -247,7 +259,6 @@ def plot(study, output, experiment, reference, summaries, observations):
     boundary = experiment["forget_updates"]
     x = [row["step"] for row in summaries]
     colors = {"initial": "#555555", "forget": "#D55E00", "retain": "#0072B2"}
-    point_colors = [colors[row["phase"]] for row in summaries]
 
     def save(figure, name):
         figure.tight_layout()
@@ -256,13 +267,23 @@ def plot(study, output, experiment, reference, summaries, observations):
         plt.close(figure)
 
     def mark(axis):
-        axis.axvline(boundary, color="#666666", linestyle=":", label="F to R switch")
+        has_switch = experiment.get("retain_updates", 0) > 0
+        if has_switch:
+            axis.axvline(boundary, color="#666666", linestyle=":", label="F to R switch")
+        high = max(x + ([boundary] if has_switch else []))
+        padding = max(high - min(x), 1) * .03
+        axis.set_xlim(min(x) - padding, high + padding)
         axis.set_xlabel("Complete optimizer update")
         axis.grid(alpha=.2)
 
     def series(axis, key, label):
-        axis.plot(x, [row[key] for row in summaries], color="#555555", linewidth=1, zorder=1)
-        axis.scatter(x, [row[key] for row in summaries], c=point_colors, s=28, zorder=2)
+        values = [float("nan") if row[key] is None else row[key] for row in summaries]
+        axis.plot(x, values, color="#555555", linewidth=1, zorder=1)
+        measured = [(row["step"], row[key], colors[row["phase"]]) for row in summaries if row[key] is not None]
+        if measured:
+            axis.scatter([r[0] for r in measured], [r[1] for r in measured], c=[r[2] for r in measured], s=28, zorder=2)
+        else:
+            axis.text(.5, .5, "Not measured", ha="center", va="center", transform=axis.transAxes)
         axis.set_ylabel(label)
         mark(axis)
 
@@ -281,7 +302,7 @@ def plot(study, output, experiment, reference, summaries, observations):
     figure, axes = plt.subplots(1, 3, figsize=(14, 4))
     for axis, key, label in zip(axes, LOSS_FIELDS, ("Forget sensitive-token loss", "Retain NLL", "Common-token KL")):
         series(axis, key, label)
-    figure.suptitle("All three raw losses measured on the same fixed probe sets (including inactive objectives)", fontsize=11)
+    figure.suptitle("Fixed-probe raw losses; unmeasured quantities remain blank", fontsize=11)
     save(figure, "fixed_loss_curves")
 
     online = read_rows(Path(study) / "run/loss_history.jsonl")
@@ -301,12 +322,17 @@ def plot(study, output, experiment, reference, summaries, observations):
     figure, axes = plt.subplots(1, 2, figsize=(11, 4.5))
     for axis, loss, metric, label in ((axes[0], "raw_sensitive_loss", "forget_quality", "Forget sensitive-token loss"),
                                      (axes[1], "raw_retain_nll", "model_utility", "Retain NLL")):
+        measured = [row for row in summaries if row[loss] is not None and row[metric] is not None]
         for phase in ("initial", "forget", "retain"):
-            selected = [row for row in summaries if row["phase"] == phase]
+            selected = [row for row in measured if row["phase"] == phase]
             axis.scatter([row[loss] for row in selected], [row[metric] for row in selected], color=colors[phase], label=phase)
-        axis.plot([row[loss] for row in summaries], [row[metric] for row in summaries], color="#777777", alpha=.5, zorder=0)
-        for row in summaries:
+        axis.plot([float("nan") if row[loss] is None or row[metric] is None else row[loss] for row in summaries],
+                  [float("nan") if row[loss] is None or row[metric] is None else row[metric] for row in summaries],
+                  color="#777777", alpha=.5, zorder=0)
+        for row in measured:
             axis.annotate(str(row["step"]), (row[loss], row[metric]), xytext=(3, 3), textcoords="offset points", fontsize=7)
+        if not measured:
+            axis.text(.5, .5, "Not measured", ha="center", va="center", transform=axis.transAxes)
         axis.set(xlabel=label, ylabel="FQ" if metric == "forget_quality" else "MU")
         axis.grid(alpha=.2); axis.legend(fontsize=8)
     figure.suptitle("Fixed-probe loss versus metric; labels are optimizer updates", fontsize=11)
@@ -339,7 +365,8 @@ def plot(study, output, experiment, reference, summaries, observations):
             ecdf(axis, reference, field, color="black", linestyle="--", linewidth=1.6, label="Retain reference")
             ecdf(axis, samples, field, color=colors[summary["phase"]], label=f"Step {summary['step']} ({summary['phase']})")
             axis.set_xlabel(label); axis.legend(fontsize=8)
-        figure.suptitle(f"Step {summary['step']}: FQ={summary['forget_quality']:.5g}, MU={summary['model_utility']:.5g}, "
+        mu_label = "not measured" if summary["model_utility"] is None else f"{summary['model_utility']:.5g}"
+        figure.suptitle(f"Step {summary['step']}: FQ={summary['forget_quality']:.5g}, MU={mu_label}, "
                        f"D_low={summary['D_low']:.3f}, D_high={summary['D_high']:.3f}", fontsize=11)
         save(figure, f"ecdf_by_step/step_{summary['step']:06d}")
 
@@ -374,11 +401,13 @@ def analyze(study, output=None, plots=True):
     expected_final = experiment["forget_updates"] + experiment["retain_updates"]
     report = dict(status="final_observation_available" if summaries and summaries[-1]["step"] == expected_final else "partial",
         completed_evaluation_steps=[row["step"] for row in summaries], planned_final_step=expected_final,
-        forget_to_retain_switch_step=experiment["forget_updates"], sample_count=len(reference),
+        forget_to_retain_switch_step=experiment["forget_updates"] if experiment["retain_updates"] else None, sample_count=len(reference),
         reference_sha256=hashlib.sha256((study / "frozen/retain_reference.json").read_bytes()).hexdigest(),
         reference_summary=distribution_summary(reference),
         native_tr_underflow_count=sum(row["native_tr_underflow"] for row in samples),
         native_FQ_MU_match_history=bool(summaries), KS_D_reconstructed_from_native_raw_TR=bool(summaries),
+        measured_model_utility_steps=[row["step"] for row in summaries if row["model_utility"] is not None],
+        unmeasured_model_utility_steps=[row["step"] for row in summaries if row["model_utility"] is None],
         FQ_pvalue_recomputed=False, plotted=bool(plots and summaries))
     if plots and summaries:
         plot(study, output, experiment, reference, summaries, observations)
@@ -393,9 +422,11 @@ def analyze(study, output=None, plots=True):
         "`D_low=max(CDF_run-CDF_Retain)` and `D_high=max(CDF_Retain-CDF_run)`; KS D is their maximum. "
         "High-TR dominance indicates the direction of the largest CDF discrepancy, not that every sample has crossed the reference. "
         "FQ is the saved native KS p-value; this analysis checks cache/history agreement and independently reconstructs D, without recomputing p-values. "
-        "MU is checked against its native cached value; its nine components are not independently re-evaluated here.\n\n"
+        "Every measured MU is checked against its native cached value; its nine components are not independently re-evaluated here. "
+        "An explicitly scoped Forget-only run measures MU only at its terminal step. Unmeasured MU and fixed Retain NLL are null in JSON "
+        "and blank in CSV/plots; missing values are never replaced with zero or interpolated.\n\n"
         "Metric/loss scatter plots use post-update fixed-probe losses. Online batch losses are plotted separately and are not interchangeable. "
-        "All figures use complete optimizer updates on the horizontal axis; the dotted line marks the objective switch. "
+        "All figures use complete optimizer updates on the horizontal axis; when a retain phase is planned, the dotted line marks the objective switch. "
         "Quantiles and ECDFs describe across-question distributions, not uncertainty over seeds or proof of knowledge deletion. "
         "The two-epoch evaluation interval can miss a shorter-lived minimum of distribution distance.\n")
     atomic_text(output / "analysis_manifest.json", json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n")

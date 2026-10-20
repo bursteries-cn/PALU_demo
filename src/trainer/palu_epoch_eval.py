@@ -315,7 +315,8 @@ class PALUEpochTrainer(PALU):
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 fixed_started = time.perf_counter()
-                losses = self._fixed_losses(step, epoch)
+                provider = getattr(self, "_fixed_loss_provider", self._fixed_losses)
+                losses = provider(step, epoch)
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 fixed_seconds = time.perf_counter() - fixed_started
@@ -328,7 +329,8 @@ class PALUEpochTrainer(PALU):
         finally:
             self._palu_diagnostic_mode = previous_diagnostic
             self._epoch_loss_forget_only = False
-        for key in ("forget_quality", "model_utility"):
+        required_metrics = getattr(self, "_evaluation_metrics", ("forget_quality", "model_utility"))
+        for key in required_metrics:
             if not isinstance(metrics.get(key), (int, float)) or not math.isfinite(metrics[key]):
                 raise ValueError(f"Epoch evaluation is missing a finite {key}")
         evaluator = next(iter(self.evaluators.values()))
@@ -360,7 +362,8 @@ class PALUEpochTrainer(PALU):
                "unique_retain_examples_cumulative": len({pair["retain_index"] for pair in pairs}),
                "evaluation_kind": "initial" if step == 0 else "final_tail" if partial else "epoch_end",
                "partial_epoch": partial, **losses,
-               "forget_quality": metrics["forget_quality"], "model_utility": metrics["model_utility"],
+               "forget_quality": metrics["forget_quality"], "model_utility": metrics.get("model_utility"),
+               "evaluation_metrics": list(required_metrics),
                "ks_d": d, "forget_ks_statistic": d,
                "forget_truth_ratio_count": len(current_scores),
                "reference_truth_ratio_count": len(reference_scores),

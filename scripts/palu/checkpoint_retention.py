@@ -56,8 +56,39 @@ def owned_checkpoint(run, step):
     return checkpoint
 
 
+def observation_scope(epoch, manifest):
+    """Resolve omissions from the run's frozen policy, never from row claims alone."""
+    policy = manifest.get("threshold_plan", {}).get("evaluation_policy")
+    full_metrics = ["forget_quality", "model_utility"]
+    if policy != "forget_light_v1":
+        if epoch.get("fixed_loss_scope", "full") != "full" or epoch.get("evaluation_metrics", full_metrics) != full_metrics:
+            raise ValueError("Reduced observation scope is not authorized by the run plan")
+        return full_metrics, False
+    final = manifest.get("final_model_step")
+    step = epoch["step"]
+    if type(final) is not int or final <= 0 or type(step) is not int or not 0 <= step <= final:
+        raise ValueError("Invalid terminal step for the scoped observation")
+    metrics = full_metrics if step == final else ["forget_quality"]
+    if epoch.get("evaluation_metrics") != metrics:
+        raise ValueError("Observation metrics do not match the planned terminal/intermediate scope")
+    if epoch.get("fixed_loss_scope") != "forget_only":
+        raise ValueError("Lightweight Forget observations require fixed_loss_scope=forget_only")
+    if epoch.get("raw_retain_nll", "missing") is not None or any(
+            type(epoch.get(key)) is not int or epoch[key] != 0 for key in ("retain_count", "retain_token_count")):
+        raise ValueError("Unmeasured Retain loss must be null with zero sample and token counts")
+    if epoch.get("forget_count") != manifest["schedule_metadata"]["data_sizes"]["forget"]:
+        raise ValueError("Lightweight observations must cover the complete fixed Forget set")
+    if "model_utility" not in metrics and epoch.get("model_utility", "missing") is not None:
+        raise ValueError("Unmeasured MU must be explicitly null")
+    return metrics, True
+
+
 def validate_fixed_samples(rows, epoch, manifest):
-    expected_sizes = manifest["schedule_metadata"]["data_sizes"]
+    _, forget_only = observation_scope(epoch, manifest)
+    expected_sizes = dict(manifest["schedule_metadata"]["data_sizes"])
+    expected_counts = dict(manifest["schedule_metadata"]["fixed_target_counts"])
+    if forget_only:
+        expected_sizes["retain"] = expected_counts["retain"] = 0
     observed = {split: set() for split in ("forget", "retain")}
     sums = {key: 0.0 for key in ("sensitive", "common", "retain")}
     counts = {key: 0 for key in sums}
@@ -73,15 +104,19 @@ def validate_fixed_samples(rows, epoch, manifest):
             ("common", "raw_common_kl", "common_token_count"))
         for key, value_key, count_key in components:
             value, count = sample[value_key], sample[count_key]
-            if not isinstance(value, (int, float)) or not math.isfinite(value) or not isinstance(count, int) or count < 0:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or type(count) is not int or count < 0:
                 raise ValueError("Nonfinite per-example loss or invalid target count")
             sums[key] += value * count
             counts[key] += count
     if any(len(observed[split]) != expected_sizes[split] for split in observed):
         raise ValueError("Incomplete fixed per-example evaluation; weights must be retained")
-    if counts != manifest["schedule_metadata"]["fixed_target_counts"]:
+    if counts != expected_counts:
         raise ValueError("Per-example target counts differ from the frozen dataset")
     for key, field in (("sensitive", "raw_sensitive_loss"), ("common", "raw_common_kl"), ("retain", "raw_retain_nll")):
+        if forget_only and key == "retain":
+            continue
+        if forget_only and epoch.get(key + "_token_count") != counts[key]:
+            raise ValueError("Reported target counts differ from the fixed per-example records")
         if not math.isclose(sums[key] / max(counts[key], 1), epoch[field], rel_tol=1e-8, abs_tol=1e-9):
             raise ValueError("Per-example losses do not reconstruct the reported epoch loss")
 
@@ -95,24 +130,30 @@ def validate_observation(evals, epoch, manifest):
     expected_reference = manifest["schedule_metadata"].get("seed103_source_provenance", {}).get("reference_sha256")
     if expected_reference and epoch["reference_sha256"] != expected_reference:
         raise ValueError("Epoch used a different FQ reference")
+    metrics, _ = observation_scope(epoch, manifest)
     native = json.loads((evals / "TOFU_EVAL.json").read_text())
-    for key in ("forget_quality", "model_utility", "ks_d"):
-        if not isinstance(epoch[key], (int, float)) or not math.isfinite(epoch[key]):
+    for key in metrics + ["ks_d"]:
+        if isinstance(epoch.get(key), bool) or not isinstance(epoch.get(key), (int, float)) or not math.isfinite(epoch[key]):
             raise ValueError("Missing or nonfinite FQ/MU/KS D")
-    for key in ("forget_quality", "model_utility"):
+    for key in metrics:
+        if key not in native:
+            raise ValueError(f"Missing required native metric: {key}")
         value = native[key]
         value = value["agg_value"] if isinstance(value, dict) else value
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"Missing or nonfinite native metric: {key}")
         if not math.isclose(value, epoch[key], rel_tol=1e-12, abs_tol=1e-14):
             raise ValueError("Native TOFU metrics differ from the epoch record")
     if len(native["forget_truth_ratio"]["value_by_index"]) != manifest["schedule_metadata"]["data_sizes"]["forget"]:
         raise ValueError("Missing per-example Forget truth ratios")
     per_item = {"forget_Q_A_PARA_Prob": manifest["schedule_metadata"]["data_sizes"]["forget"],
                 "forget_Q_A_PERT_Prob": manifest["schedule_metadata"]["data_sizes"]["forget"]}
-    per_item.update({key: size for prefix, size, keys in (
-        ("retain", 400, ("Q_A_Prob", "Q_A_PARA_Prob", "Q_A_PERT_Prob", "Q_A_ROUGE", "Truth_Ratio")),
-        ("ra", 100, ("Q_A_Prob", "Q_A_PERT_Prob", "Q_A_Prob_normalised", "Q_A_ROUGE", "Truth_Ratio")),
-        ("wf", 117, ("Q_A_Prob", "Q_A_PERT_Prob", "Q_A_Prob_normalised", "Q_A_ROUGE", "Truth_Ratio")))
-        for key in (prefix + "_" + suffix for suffix in keys)})
+    if "model_utility" in metrics:
+        per_item.update({key: size for prefix, size, keys in (
+            ("retain", 400, ("Q_A_Prob", "Q_A_PARA_Prob", "Q_A_PERT_Prob", "Q_A_ROUGE", "Truth_Ratio")),
+            ("ra", 100, ("Q_A_Prob", "Q_A_PERT_Prob", "Q_A_Prob_normalised", "Q_A_ROUGE", "Truth_Ratio")),
+            ("wf", 117, ("Q_A_Prob", "Q_A_PERT_Prob", "Q_A_Prob_normalised", "Q_A_ROUGE", "Truth_Ratio")))
+            for key in (prefix + "_" + suffix for suffix in keys)})
     for key, size in per_item.items():
         if key not in native or len(native[key].get("value_by_index") or {}) != size:
             raise ValueError(f"Incomplete native per-example evaluation: {key}")

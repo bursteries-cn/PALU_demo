@@ -70,7 +70,8 @@ class SequentialPlots(unittest.TestCase):
             study = Path(directory)
             (study / "frozen").mkdir(); (study / "run/checkpoint-13/evals").mkdir(parents=True)
             plan = dict(forget_updates=63, retain_updates=63, phase_epoch_size=200,
-                        retain_epoch_size=200, learning_rate=1e-5)
+                        retain_epoch_size=200, learning_rate=1e-5,
+                        evaluation_policy="Initial, first complete update at/after every two F200 exposure epochs, and stop point")
             (study / "experiment.json").write_text(json.dumps(plan))
             native = payload([(3., 2.), (2., 4.)])
             (study / "frozen/retain_reference.json").write_text(json.dumps(native))
@@ -105,6 +106,49 @@ class SequentialPlots(unittest.TestCase):
             history.write_text('{"step":\n')
             with self.assertRaisesRegex(ValueError, "complete JSONL"):
                 analysis.read_rows(history)
+
+    def test_lightweight_export_retains_nulls_and_requires_terminal_mu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            study = Path(directory)
+            (study / "frozen").mkdir()
+            (study / "run").mkdir()
+            plan = dict(forget_updates=63, retain_updates=0, phase_epoch_size=200,
+                        evaluation_policy="forget_light_v1")
+            (study / "experiment.json").write_text(json.dumps(plan))
+            manifest = dict(threshold_plan=plan, final_model_step=19,
+                            schedule_metadata={"data_sizes": {"forget": 2, "retain": 3}})
+            (study / "run/manifest.json").write_text(json.dumps(manifest))
+            native = payload([(3., 2.), (2., 4.)])
+            (study / "frozen/retain_reference.json").write_text(json.dumps(native))
+            rows = []
+            for step in (0, 13, 19):
+                folder = study / f"run/checkpoint-{step}/evals"
+                folder.mkdir(parents=True)
+                current = dict(native)
+                if step != 19:
+                    del current["model_utility"]
+                (folder / "TOFU_EVAL.json").write_text(json.dumps(current))
+                rows.append(dict(step=step, forget_quality=.5, model_utility=.6 if step == 19 else None, ks_d=0.,
+                    raw_sensitive_loss=.3, raw_retain_nll=None, raw_common_kl=.05, retain_count=0,
+                    retain_token_count=0, forget_count=2, fixed_loss_scope="forget_only",
+                    evaluation_metrics=["forget_quality", "model_utility"] if step == 19 else ["forget_quality"]))
+            history = study / "run/epoch_history.jsonl"
+            history.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            report = analysis.analyze(study, plots=False)
+            self.assertEqual(report["measured_model_utility_steps"], [19])
+            self.assertEqual(report["unmeasured_model_utility_steps"], [0, 13])
+            with (study / "analysis/evaluation_summary.csv").open() as stream:
+                table = list(csv.DictReader(stream))
+            self.assertEqual([row["raw_retain_nll"] for row in table], ["", "", ""])
+            self.assertEqual([row["model_utility"] for row in table], ["", "", "0.6"])
+            self.assertEqual(len(analysis.collect(study)[3]), 6)
+            rows[-1].update(model_utility=None, evaluation_metrics=["forget_quality"])
+            history.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaisesRegex(ValueError, "terminal/intermediate"):
+                analysis.analyze(study, plots=False)
+            (study / "run/manifest.json").unlink()
+            with self.assertRaisesRegex(ValueError, "evaluation policy"):
+                analysis.analyze(study, plots=False)
 
 
 if __name__ == "__main__":

@@ -245,7 +245,7 @@ class FrozenSplit:
         return dict(self.samples[index], index=index)
 
 
-def build_probe(config, schedule, runtime, output, torch):
+def build_probe(config, schedule, runtime, output, torch, *, metric_names=None):
     """Reuse native diagnostic methods, without invoking a Trainer constructor.
 
     The constructor would build another Full teacher/optimizer and reject ZeRO.
@@ -258,7 +258,8 @@ def build_probe(config, schedule, runtime, output, torch):
     model = runtime["model"]
     reference = getattr(runtime["reference"], "module", runtime["reference"])
     cfg = OmegaConf.create(copy.deepcopy(config))
-    cfg.eval.tofu.metrics = {key: cfg.eval.tofu.metrics[key] for key in ("forget_quality", "model_utility")}
+    metric_names = tuple(metric_names or ("forget_quality", "model_utility"))
+    cfg.eval.tofu.metrics = {key: cfg.eval.tofu.metrics[key] for key in metric_names}
     probe = object.__new__(PALUEpochTrainer)
     probe.model = probe.model_wrapped = model
     probe.ref_model = reference
@@ -271,6 +272,7 @@ def build_probe(config, schedule, runtime, output, torch):
     probe.train_dataset = SimpleNamespace(**{split: FrozenSplit(schedule["samples"][split]) for split in ("forget", "retain")})
     probe.data_collator = get_collators(cfg.collator, tokenizer=probe.tokenizer)
     probe.evaluators = get_evaluators(cfg.eval, template_args=probe.template_args, model=model, tokenizer=probe.tokenizer)
+    probe._evaluation_metrics = metric_names
     method = config["trainer"]["method_args"]
     for name, source in (("gamma", "gamma"), ("alpha", "alpha"), ("top_k", "top_k"),
                          ("num_sensitive_tokens", "first_n"), ("target_mode", "target_mode"),
@@ -294,7 +296,8 @@ def build_probe(config, schedule, runtime, output, torch):
 
 
 def evaluate_probe(config, schedule, runtime, output, torch, *, backend="legacy", step=0,
-                   epoch=0.0, epoch_index=0, expected_fixed_hash=None, probe=None):
+                   epoch=0.0, epoch_index=0, expected_fixed_hash=None, probe=None,
+                   metric_names=None, fixed_forget_result=None):
     """Shared online/standalone entry; all ranks participate and restore RNG/modes."""
     from trainer.palu_diagnostics import preserve_rng_and_modes
     rank, distributed = runtime["rank"], runtime["distributed"]
@@ -310,9 +313,15 @@ def evaluate_probe(config, schedule, runtime, output, torch, *, backend="legacy"
     with preserve_rng_and_modes([runtime["engine"], runtime["reference"]], runtime["device"]), torch.no_grad():
         if rank == 0 or parallel:
             try:
-                if probe is None:
+                requested = tuple(metric_names or ("forget_quality", "model_utility"))
+                if probe is None or tuple(getattr(probe, "_evaluation_metrics", requested)) != requested:
                     destination = Path(output) if rank == 0 else Path(output) / f"rank-{rank}"
-                    probe = build_probe(config, schedule, runtime, destination, torch)
+                    probe = build_probe(config, schedule, runtime, destination, torch, metric_names=requested)
+                if fixed_forget_result is not None:
+                    from forget_light_evaluation import fixed_loss_provider
+                    probe._fixed_loss_provider = fixed_loss_provider(probe, fixed_forget_result)
+                else:
+                    probe.__dict__.pop("_fixed_loss_provider", None)
                 with parallel.activate(probe, models) if parallel else rpc.root_models() if rpc else nullcontext():
                     probe._prepare_fixed_data()
                     if expected_fixed_hash and probe._epoch_fixed_manifest["fixed_dataset_sha256"] != expected_fixed_hash:
@@ -374,10 +383,19 @@ class OnlineEpochEvaluation:
             print(json.dumps({"event": "epoch_evaluation_begin", **event}), flush=True)
         error, row, stats = None, None, {}
         try:
+            light_options = {}
+            fresh_probe_seconds = 0.0
+            if manifest.get("threshold_plan", {}).get("evaluation_policy") == "forget_light_v1":
+                from forget_light_evaluation import prepare_observation
+                light_options, fresh_probe_seconds = prepare_observation(self, completed_updates)
             self.probe, row, stats = evaluate_probe(self.config, self.schedule, runtime, self.output, torch,
                 backend=self.backend, step=completed_updates, epoch=event["weight_update_epochs"],
                 epoch_index=event["source_epoch_index"],
-                expected_fixed_hash=manifest["schedule_metadata"]["fixed_dataset_sha256"], probe=self.probe)
+                expected_fixed_hash=manifest["schedule_metadata"]["fixed_dataset_sha256"], probe=self.probe,
+                **light_options)
+            if row is not None and light_options:
+                row["evaluation_wall_seconds"] += fresh_probe_seconds
+                row["fixed_loss_wall_seconds"] += fresh_probe_seconds
         except Exception as exc:
             if self.backend == "sharded":
                 raise

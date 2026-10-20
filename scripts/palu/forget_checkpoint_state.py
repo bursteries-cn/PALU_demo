@@ -34,8 +34,14 @@ def _evaluation_state(runtime, torch):
         state.restore_rng(rng, runtime, torch)
 
 
-def raw_forget_loss(model, reference, inputs, *, top_k, first_n, eos, torch):
-    """Same native-dtype PALU F arithmetic, with no KL or Retain forward."""
+def raw_forget_loss(model, reference, inputs, *, top_k, first_n, eos, torch,
+                    include_common_kl=False):
+    """Native PALU F, optionally common KL from the same two forwards.
+
+    The legacy result is ``(F, sensitive_count)``. With common KL enabled it is
+    ``(F, sensitive_count, KL, common_count)``. KL is student-to-Full-teacher,
+    retaining native dtype and reduction order before converting the scalar.
+    """
     forward = {key: inputs[key] for key in ("input_ids", "attention_mask")}
     forward["use_cache"] = False
     logits = model(**forward).logits[..., :-1, :].contiguous()
@@ -48,16 +54,30 @@ def raw_forget_loss(model, reference, inputs, *, top_k, first_n, eos, torch):
     mask = gradient.sensitive_mask(inputs["labels"], eos, first_n, torch).reshape(-1)
     count = int(mask.sum())
     loss = (per_token * mask).sum() / mask.sum().clamp(min=1)
-    return float(loss.double()), count
+    result = (float(loss.double()), count)
+    if not include_common_kl:
+        return result
+    common = (inputs["labels"][..., 1:] == -200).reshape(-1)
+    common_count = int(common.sum())
+    if common_count:
+        reference_log_prob = torch.nn.functional.log_softmax(teacher, dim=-1).view_as(flat)
+        log_prob = torch.nn.functional.log_softmax(logits, dim=-1).view_as(flat)
+        per_token_kl = torch.sum(torch.exp(log_prob) * (log_prob - reference_log_prob), dim=-1)
+        common_loss = (per_token_kl * common).sum() / common.sum().clamp(min=1)
+    else:
+        common_loss = torch.tensor(0.0, device=flat.device)
+    return (*result, float(common_loss.double()), common_count)
 
 
-def fixed_forget_probe(runtime, schedule, method, torch):
+def fixed_forget_probe(runtime, schedule, method, torch, *, include_common_kl=False):
     """Probe all fixed Forget samples using equal target-token weights.
 
     Rank r handles r, r+world, ... . The fixed pool must divide evenly across
     ranks, ensuring every rank executes the same number of student/teacher
     ZeRO forwards. The production pool is 200, world=4 (50 pairs of forwards).
-    No generation, common KL, Retain samples or optimizer calls are performed.
+    No generation, Retain samples or optimizer calls are performed. Common KL
+    is optional for compatibility with frozen old plans; it reuses the F
+    student/teacher logits and never requires another model forward.
     """
     samples = schedule["samples"]["forget"]
     rank, world = runtime["rank"], runtime["world"]
@@ -76,12 +96,13 @@ def fixed_forget_probe(runtime, schedule, method, torch):
             inputs = {"input_ids": ids,
                       "attention_mask": ids.ne(runtime["tokenizer"].pad_token_id),
                       "labels": sample["labels"].unsqueeze(0).to(runtime["device"])}
-            loss, count = raw_forget_loss(runtime["model"], runtime["reference"], inputs,
+            values = raw_forget_loss(runtime["model"], runtime["reference"], inputs,
                 top_k=int(method["top_k"]), first_n=int(method["first_n"]),
-                eos=runtime["tokenizer"].eos_token_id, torch=torch)
-            if not math.isfinite(loss):
+                eos=runtime["tokenizer"].eos_token_id, torch=torch,
+                include_common_kl=include_common_kl)
+            if not all(math.isfinite(value) for value in values):
                 raise ValueError("Fixed Forget probe produced a nonfinite loss")
-            rows.append((index, loss, count))
+            rows.append((index, *values))
         if runtime["distributed"]:
             rows = [row for shard in state.all_ranks(rows, runtime, torch) for row in shard]
     rows.sort()
@@ -91,14 +112,31 @@ def fixed_forget_probe(runtime, schedule, method, torch):
     expected = schedule["metadata"]["fixed_target_counts"]["sensitive"]
     if not tokens or tokens != expected:
         raise ValueError("Fixed Forget probe target count differs from frozen schedule")
-    return {"raw_sensitive_loss": sum(loss * count for _, loss, count in rows) / tokens,
+    result = {"raw_sensitive_loss": sum(row[1] * row[2] for row in rows) / tokens,
             "sample_mean_raw_sensitive_loss": sum(row[1] for row in rows) / len(rows),
             "sensitive_token_count": tokens, "forget_count": len(rows),
-            "forget_zero_sensitive_examples": sum(count == 0 for _, _, count in rows),
+            "forget_zero_sensitive_examples": sum(row[2] == 0 for row in rows),
             "fixed_dataset_sha256": schedule["metadata"]["fixed_dataset_sha256"],
             "elapsed_seconds": time.perf_counter() - started,
             "reduction": "fixed Forget pool; native per-sample F times shifted sensitive token count",
             "rng_and_module_modes_restored": True}
+    if include_common_kl:
+        common_tokens = sum(row[4] for row in rows)
+        if common_tokens != schedule["metadata"]["fixed_target_counts"]["common"]:
+            raise ValueError("Fixed Forget probe common target count differs from frozen schedule")
+        result.update(
+            raw_common_kl=sum(row[3] * row[4] for row in rows) / max(common_tokens, 1),
+            sample_mean_raw_common_kl=sum(row[3] for row in rows) / len(rows),
+            common_token_count=common_tokens,
+            forget_zero_common_examples=sum(row[4] == 0 for row in rows),
+            reduction="fixed Forget pool; native per-sample F/KL times respective shifted target token counts",
+            fixed_loss_samples=[{
+                "split": "forget", "dataset_index": index,
+                "raw_sensitive_loss": loss, "raw_common_kl": common_loss,
+                "raw_retain_nll": None, "sensitive_token_count": count,
+                "common_token_count": common_count, "retain_token_count": None,
+            } for index, loss, count, common_loss, common_count in rows])
+    return result
 
 
 def _broadcast_error(error, runtime, torch):

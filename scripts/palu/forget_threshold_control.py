@@ -98,10 +98,15 @@ class ForgetThresholdControl:
         self._next_update_step += 1
         if step not in self.probe_steps:
             return False
-        self.last_probe = fixed_forget_probe(runtime, schedule, config["trainer"]["method_args"], torch)
+        light = self.plan.get("evaluation_policy") == "forget_light_v1"
+        options = {"include_common_kl": True} if light else {}
+        self.last_probe = fixed_forget_probe(runtime, schedule, config["trainer"]["method_args"], torch, **options)
+        if light:
+            online.fixed_forget_probe_result = (step, self.last_probe)
         loss = float(self.last_probe["raw_sensitive_loss"])
         self.decision = stop_decision(step, loss, self.plan)
-        row = dict(self.last_probe, step=step, measurement="post-update fixed Forget token mean",
+        row = dict({k: v for k, v in self.last_probe.items() if k != "fixed_loss_samples"},
+                   step=step, measurement="post-update fixed Forget token mean",
                    seed=self.plan["seed"], consumed_pairs=step * 32, pending_pairs=0,
                    probe_interval=self.plan.get("probe_interval", "update"),
                    actual_data_epochs=step * 32 / 200,
@@ -109,6 +114,9 @@ class ForgetThresholdControl:
                    band_hit=self.plan["threshold_low"] <= loss and threshold_reached(loss, self.plan),
                    stop_reason=self.decision["stop_reason"] if self.decision else None)
         if runtime["rank"] == 0:
+            for sample in self.last_probe.get("fixed_loss_samples", []):
+                base.append_json(args.output / "forget_probe_samples.jsonl",
+                                 dict(sample, step=step, epoch=step * 32 / 200))
             base.append_json(args.output / "forget_probe_history.jsonl", row)
             print(__import__("json").dumps({"event": "fixed_forget_probe", **row}), flush=True)
         if self.decision is None:
@@ -161,6 +169,33 @@ class ForgetThresholdControl:
         return False  # shared loop writes completion timestamps and final checks
 
 
+def validate_light_probes(probes, samples, metadata):
+    """Check every epoch probe, including epochs with no TOFU evaluation."""
+    grouped = {row["step"]: [] for row in probes}
+    for sample in samples:
+        if sample["step"] not in grouped:
+            raise ValueError("Fixed probe samples contain an unrecorded step")
+        grouped[sample["step"]].append(sample)
+    size = metadata["data_sizes"]["forget"]
+    for row in probes:
+        rows = grouped[row["step"]]
+        if (row["fixed_dataset_sha256"] != metadata["fixed_dataset_sha256"]
+                or len(rows) != size or row["forget_count"] != size
+                or {r["dataset_index"] for r in rows} != set(range(size))
+                or any(r["split"] != "forget" for r in rows)):
+            raise ValueError("Fixed probe samples differ from the frozen F200 set")
+        for component, field in (("sensitive", "raw_sensitive_loss"), ("common", "raw_common_kl")):
+            count_key = component + "_token_count"
+            if any(not isinstance(r[field], (int, float)) or not math.isfinite(r[field])
+                   or type(r[count_key]) is not int or r[count_key] < 0 for r in rows):
+                raise ValueError("Invalid fixed probe per-example loss or count")
+            count = sum(r[count_key] for r in rows)
+            value = sum(r[field] * r[count_key] for r in rows) / max(count, 1)
+            if (count != metadata["fixed_target_counts"][component] or row[count_key] != count
+                    or not math.isclose(value, row[field], rel_tol=1e-8, abs_tol=1e-9)):
+                raise ValueError("Fixed probe token counts or aggregate loss do not reconstruct")
+
+
 def validate(study):
     """Audit actual early-stop results, never require all maximum-budget updates."""
     import checkpoint_retention as retention
@@ -185,6 +220,9 @@ def validate(study):
     if any(not math.isfinite(r["raw_sensitive_loss"]) or r["raw_sensitive_loss"] < 0
            for r in probes):
         raise ValueError("Fixed Forget probes contain an invalid loss")
+    if plan.get("evaluation_policy") == "forget_light_v1":
+        validate_light_probes(probes, read_rows(run / "forget_probe_samples.jsonl"),
+                              manifest["schedule_metadata"])
     for row in losses:
         if [row[k] for k in ("gamma_used", "alpha_used", "common_used")] != [1, 0, 2]:
             raise ValueError("Forget objective changed")

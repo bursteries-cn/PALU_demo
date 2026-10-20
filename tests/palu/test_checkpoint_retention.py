@@ -67,6 +67,70 @@ class RetentionTests(unittest.TestCase):
     def commit(self):
         return retention.commit_observation(self.run, self.manifest, self.checkpoint, *self.inputs())
 
+    def light_inputs(self, step=6):
+        self.manifest.update(threshold_plan={"evaluation_policy": "forget_light_v1"}, final_model_step=60)
+        epoch, source, fixed = self.inputs(step)
+        epoch.update(evaluation_metrics=["forget_quality"] if step < 60 else ["forget_quality", "model_utility"],
+                     fixed_loss_scope="forget_only", raw_retain_nll=None, retain_count=0,
+                     retain_token_count=0, forget_count=2, sensitive_token_count=3, common_token_count=2)
+        if step < 60:
+            epoch["model_utility"] = None
+            native = json.loads((source / "TOFU_EVAL.json").read_text())
+            retention.atomic_json(source / "TOFU_EVAL.json", {k: v for k, v in native.items() if k.startswith("forget")})
+        fixed.write_text("".join(json.dumps(dict(row, step=step)) + "\n" for row in self.samples if row["split"] == "forget"))
+        return epoch, source, fixed
+
+    def test_scoped_receipt_prunes_with_complete_forget_losses_and_fq(self):
+        epoch, source, fixed = self.light_inputs()
+        row = retention.commit_observation(self.run, self.manifest, self.checkpoint, epoch, source, fixed)
+        self.assertIsNone(row["raw_retain_nll"])
+        self.assertIsNone(row["model_utility"])
+        retention.prune_intermediate(self.run, self.manifest, self.checkpoint)
+        self.assertFalse(list((self.run / "checkpoint-6").glob("*.safetensors")))
+        self.assertEqual(retention.read_receipt(self.run, self.manifest, self.checkpoint), row)
+
+    def test_row_scope_cannot_weaken_a_legacy_plan(self):
+        epoch, source, fixed = self.light_inputs()
+        del self.manifest["threshold_plan"]
+        with self.assertRaisesRegex(ValueError, "not authorized"):
+            retention.commit_observation(self.run, self.manifest, self.checkpoint, epoch, source, fixed)
+
+    def test_legacy_free_text_evaluation_policy_preserves_full_requirements(self):
+        self.manifest["threshold_plan"] = {"evaluation_policy":
+            "Initial, first complete update at/after every two F200 exposure epochs, and stop point"}
+        self.commit()
+        epoch, source, fixed = self.inputs()
+        epoch.update(evaluation_metrics=["forget_quality"], fixed_loss_scope="forget_only")
+        with self.assertRaisesRegex(ValueError, "not authorized"):
+            retention.commit_observation(self.run, self.manifest, self.checkpoint, epoch, source, fixed)
+
+    def test_lightweight_terminal_requires_mu_and_all_native_mu_samples(self):
+        epoch, source, fixed = self.light_inputs(60)
+        checkpoint = self.manifest["checkpoints"][-1]
+        for invalid in (dict(epoch, evaluation_metrics=["forget_quality"], model_utility=None),
+                        dict(epoch, model_utility=None)):
+            with self.assertRaises(ValueError):
+                retention.commit_observation(self.run, self.manifest, checkpoint, invalid, source, fixed)
+        native = json.loads((source / "TOFU_EVAL.json").read_text())
+        del native["wf_Q_A_ROUGE"]
+        retention.atomic_json(source / "TOFU_EVAL.json", native)
+        with self.assertRaisesRegex(ValueError, "Incomplete native"):
+            retention.commit_observation(self.run, self.manifest, checkpoint, epoch, source, fixed)
+        epoch, source, fixed = self.light_inputs(60)
+        retention.commit_observation(self.run, self.manifest, checkpoint, epoch, source, fixed)
+
+    def test_lightweight_counts_losses_and_omissions_are_strict(self):
+        epoch, source, fixed = self.light_inputs()
+        for invalid in (dict(epoch, raw_common_kl=.4), dict(epoch, common_token_count=1),
+                        dict(epoch, forget_count=1), dict(epoch, raw_retain_nll=0.),
+                        dict(epoch, retain_token_count=6), dict(epoch, model_utility=0.),
+                        dict(epoch, evaluation_metrics=["forget_quality", "model_utility"])):
+            with self.assertRaises(ValueError):
+                retention.commit_observation(self.run, self.manifest, self.checkpoint, invalid, source, fixed)
+        fixed.write_text(json.dumps(dict(self.samples[0], step=6)) + "\n")
+        with self.assertRaisesRegex(ValueError, "Incomplete fixed"):
+            retention.commit_observation(self.run, self.manifest, self.checkpoint, epoch, source, fixed)
+
     def test_delete_only_weights_after_complete_evaluation(self):
         row = self.commit()
         retention.rebuild_aggregates(self.run, [row])
