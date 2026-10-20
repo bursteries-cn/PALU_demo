@@ -122,6 +122,24 @@ def objective_coefficients(control, step, method):
     return gamma, alpha, common
 
 
+def retain_backward_policy(config, control, alpha):
+    """Enable the optional optimization only from the immutable threshold plan.
+
+    Missing flag preserves historical behavior. A nonzero Retain coefficient
+    always requires its backward graph, even when the optimization is requested.
+    """
+    plan = config.get("forget_threshold_plan", {})
+    requested = plan.get("zero_weight_retain_no_grad", False)
+    if type(requested) is not bool:
+        raise ValueError("zero_weight_retain_no_grad must be a frozen boolean")
+    if requested and getattr(control, "plan", None) != plan:
+        raise ValueError("Retain backward optimization requires the exact frozen threshold controller plan")
+    requires_grad = not (requested and alpha == 0.0)
+    return dict(zero_weight_retain_no_grad=requested,
+                retain_requires_grad=requires_grad,
+                retain_backward_mode="native_backward" if requires_grad else "no_grad_logging")
+
+
 def after_complete_update(control, runtime, manifest, config, schedule, args, step, online, torch):
     """Optional stopping decision, after the optimizer step and before evaluation."""
     if control is None or not hasattr(control, "after_update"):
@@ -389,6 +407,8 @@ def train(args, torch, control=None):
                "consumed_pairs": 0, "actual_data_epochs": 0.0,
                "completed_data_epochs": 0, "evaluation_kind": "initial"}
     started = time.time()
+    initial_alpha = objective_coefficients(control, int(windows[0]["step"]), method)[1]
+    initial_retain_policy = retain_backward_policy(config, control, initial_alpha)
     manifest = {"schema": 1, "status": "training", "layout": args.layout,
                 "normalization": "whole_update_token_denominators" if args.normalization == "global" else "native_microbatch_means",
                 "loss_mode": args.normalization, "padding_scope": args.padding_scope, "seed": args.seed,
@@ -405,6 +425,7 @@ def train(args, torch, control=None):
                 "deepspeed_config": runtime["ds_config"],
                 "warmup_steps": runtime["warmup_steps"], "scheduler_total_updates": runtime["scheduler_total_updates"],
                 "optimizer_precision_initial": optimizer_precision(optimizer, torch),
+                "retain_backward_policy": initial_retain_policy,
                 "max_grad_norm": float(train_args.get("max_grad_norm", 1.0)),
                 "code_sha256": {"layout_token_training.py": gradient.file_sha(__file__),
                                   "gradient_equivalence_step.py": gradient.file_sha(Path(gradient.__file__)),
@@ -441,6 +462,7 @@ def train(args, torch, control=None):
     for window in windows:
         step = int(window["step"])
         gamma, alpha, common = objective_coefficients(control, step, method)
+        retain_policy = retain_backward_policy(config, control, alpha)
         counts = gradient.target_counts(window, tokenizer.eos_token_id, int(method["first_n"]), torch)
         if counts != window["counts"] or any(counts[key] <= 0 for key in counts):
             raise AssertionError(f"Invalid whole-window denominators at {step}")
@@ -461,7 +483,8 @@ def train(args, torch, control=None):
             local = gradient.target_counts(inputs, tokenizer.eos_token_id, int(method["first_n"]), torch)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 components = gradient.raw_components(engine, reference, inputs, top_k=int(method["top_k"]),
-                           first_n=int(method["first_n"]), eos=tokenizer.eos_token_id, torch=torch)
+                           first_n=int(method["first_n"]), eos=tokenizer.eos_token_id, torch=torch,
+                           retain_requires_grad=retain_policy["retain_requires_grad"])
                 loss = gradient.weighted_loss(components, local, counts, gamma=gamma, alpha=alpha,
                                common=common, normalization=args.normalization, accumulation=accumulation, world=world)
             if not bool(torch.isfinite(loss.detach())):
@@ -548,6 +571,7 @@ def train(args, torch, control=None):
                    "clip_factor_nominal": min(1.0, float(train_args.get("max_grad_norm", 1.0)) / (norm_value + 1e-6)) if norm_value else 1.0,
                    "lr_before": lr_before, "lr_after": lr_after, "microsteps": micros,
                    "optimizer_precision": optimizer_precision(optimizer, torch),
+                   **retain_policy,
                    "seconds_since_start": time.time() - started}
             if control is not None:
                 row.update(gamma_used=gamma, alpha_used=alpha, common_used=common,

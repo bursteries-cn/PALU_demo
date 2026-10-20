@@ -40,7 +40,10 @@ def probe_steps(plan):
 
 
 def protocol(seed=103, threshold_low=.4, threshold_high=.5, max_updates=63,
-             learning_rate=1e-5, probe_interval="epoch", threshold_comparison=None):
+             learning_rate=1e-5, probe_interval="epoch", threshold_comparison=None,
+             zero_weight_retain_no_grad=False):
+    if type(zero_weight_retain_no_grad) is not bool:
+        raise ValueError("zero_weight_retain_no_grad must be boolean")
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
         raise ValueError("Seed must be an integer in [0, 2**32)")
     if isinstance(max_updates, bool) or not isinstance(max_updates, int) or max_updates <= 0:
@@ -61,6 +64,7 @@ def protocol(seed=103, threshold_low=.4, threshold_high=.5, max_updates=63,
         max_updates=max_updates, total_updates=max_updates, forget_updates=max_updates,
         retain_updates=0, phase_epoch_size=200, retain_epoch_size=200,
         phase_weights={"forget": [1., 0., 2.]}, forget_common_kl_weight=2.,
+        zero_weight_retain_no_grad=zero_weight_retain_no_grad,
         effective_batch=32, world_size=4, layout="four", microbatch=1,
         accumulation=8, normalization="global", padding_scope="microbatch",
         max_forget_draws=max_updates*32, max_forget_exposure_epochs=max_updates*32/200,
@@ -244,6 +248,8 @@ def frozen_plan(study):
     if any(visible.get(key) != value for key, value in plan.items()):
         raise ValueError("Experiment description differs from frozen threshold plan")
     probe_steps(plan)
+    if type(plan.get("zero_weight_retain_no_grad", False)) is not bool:
+        raise ValueError("Frozen zero_weight_retain_no_grad must be boolean")
     if plan.get("threshold_comparison", "le") not in ("lt", "le"):
         raise ValueError("Frozen threshold_comparison must be lt or le")
     return plan
@@ -319,6 +325,8 @@ def parser():
     result.add_argument("--learning-rate", type=float)
     result.add_argument("--probe-interval", choices=("epoch", "update"))
     result.add_argument("--threshold-comparison", choices=("lt", "le"))
+    result.add_argument("--zero-weight-retain-no-grad", action="store_true", default=None,
+                        help="Explicit future-plan opt-in after GPU equivalence validation; never changes an existing plan")
     return result
 
 
@@ -327,7 +335,7 @@ def main():
     args = p.parse_args()
     controls = {name: getattr(args, name) for name in
                 ("seed", "threshold_low", "threshold_high", "max_updates", "learning_rate",
-                 "probe_interval", "threshold_comparison")
+                 "probe_interval", "threshold_comparison", "zero_weight_retain_no_grad")
                 if getattr(args, name) is not None}
     if args.mode not in ("prepare", "dry-run") and (controls or args.source_study is not None):
         p.error("train/analyze/export use the frozen plan; do not pass preparation settings")

@@ -24,6 +24,21 @@ SEEDS="104 105 106" FOUR_GPUS=0,1,2,3 \
 
 默认 source 为 `artifacts/token_equal_seed103/20261017_192348`，新结果为 `artifacts/forget_threshold_light/时间戳/seed_数字`，与旧实验分开。可用 `SOURCE_STUDY`、`STUDY_DIR`、`PYTHON_BIN` 覆盖位置。`STUDY_DIR` 必须全新；现有结果不会被覆盖。每个种子启动前检查显存；任一失败后停止整个队列并保留观测及错误日志。
 
+## 零权重 R 的可选优化
+
+`ZERO_WEIGHT_RETAIN_NO_GRAD` 默认 `0`，保持原实现。仅在 seed103 固定配对的 GPU 等价性检查通过后，对**下一轮新准备的实验**显式设为 `1`：
+
+```bash
+ZERO_WEIGHT_RETAIN_NO_GRAD=1 SEEDS="103" MODE=dry-run \
+  bash scripts/palu/run_forget_until_threshold.sh
+ZERO_WEIGHT_RETAIN_NO_GRAD=1 SEEDS="103" FOUR_GPUS=0,1,2,3 \
+  bash scripts/palu/run_forget_until_threshold.sh
+```
+
+先检查 dry-run 中的 `zero_weight_retain_no_grad: true`。该值写入新实验的冻结 plan；已有 plan 缺少该字段时仍按 `false` 执行，训练阶段不能通过环境变量覆盖冻结设置。变量只接受 `0`、`1`；沿用现有完整 F/R 配对、32对整步 token 分母、模型 train 模式和 `F + 0*R + 2*common-KL` 算式。
+
+启用后，仅当该步 R 系数恰为0时，用无梯度 R 前向记录原始 R 损失，省去它的反向计算；正 R 系数仍正常构图和反向。每步 `loss_history.jsonl` 记录 `zero_weight_retain_no_grad`、`retain_requires_grad`、`retain_backward_mode`，manifest 记录 `retain_backward_policy`。此开关不改变评估、停止条件、checkpoint 留存，也不启动后续保留训练。GPU 对照未通过时保持 `0`，不能仅凭 CPU 测试启用。
+
 ## 固定条件与阈值
 
 - Llama-3.1-8B 从原始 Full 模型重新开始，每卡 batch1，累积8，四卡有效32对 F/R。

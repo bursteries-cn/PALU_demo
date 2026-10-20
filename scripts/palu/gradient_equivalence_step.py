@@ -17,6 +17,7 @@ model.named_parameters() order; gradient_layout.json describes float offsets.
 """
 
 import argparse
+from contextlib import nullcontext
 import copy
 import hashlib
 import importlib.metadata
@@ -82,13 +83,15 @@ def target_counts(inputs, eos, first_n, torch):
     }
 
 
-def raw_components(model, reference, inputs, *, top_k, first_n, eos, torch):
+def raw_components(model, reference, inputs, *, top_k, first_n, eos, torch, retain_requires_grad=True):
     """PALU native arithmetic; retain CE is obtained from the native model loss.
 
     This isolated measurement copy is checked against repository PALU.compute_loss
     on the first actual microbatch and by --self-test; core training is untouched.
     Sensitive/common numerators retain their original dtype and reduction order.
     """
+    if type(retain_requires_grad) is not bool:
+        raise TypeError("retain_requires_grad must be boolean")
     F = torch.nn.functional
     forget = {key: inputs["forget"][key] for key in ("input_ids", "attention_mask")}
     forget["use_cache"] = False
@@ -117,7 +120,9 @@ def raw_components(model, reference, inputs, *, top_k, first_n, eos, torch):
         common_loss = torch.tensor(0.0, device=flat.device)
     retain = {key: inputs["retain"][key] for key in ("input_ids", "attention_mask", "labels")}
     retain["use_cache"] = False
-    retain_loss = model(**retain).loss
+    # Keep native forward, train mode, dtype and 0*R arithmetic unchanged.
+    with nullcontext() if retain_requires_grad else torch.no_grad():
+        retain_loss = model(**retain).loss
     return {"sensitive": forget_loss, "retain": retain_loss, "common": common_loss}
 
 

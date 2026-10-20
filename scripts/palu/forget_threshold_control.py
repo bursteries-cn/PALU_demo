@@ -223,7 +223,15 @@ def validate(study):
     if plan.get("evaluation_policy") == "forget_light_v1":
         validate_light_probes(probes, read_rows(run / "forget_probe_samples.jsonl"),
                               manifest["schedule_metadata"])
+    expected_retain = base.retain_backward_policy(
+        {"forget_threshold_plan": plan}, ForgetThresholdControl(plan), 0.0)
+    if ("retain_backward_policy" in manifest or expected_retain["zero_weight_retain_no_grad"]):
+        if manifest.get("retain_backward_policy") != expected_retain:
+            raise ValueError("Manifest Retain backward mode differs from the frozen plan")
     for row in losses:
+        if expected_retain["zero_weight_retain_no_grad"] or any(key in row for key in expected_retain):
+            if any(row.get(key) != value for key, value in expected_retain.items()):
+                raise ValueError("Recorded Retain backward mode differs from the frozen plan")
         if [row[k] for k in ("gamma_used", "alpha_used", "common_used")] != [1, 0, 2]:
             raise ValueError("Forget objective changed")
         if any(not math.isclose(lr, plan["learning_rate"], rel_tol=1e-10) for lr in row["lr_before"] + row["lr_after"]):
