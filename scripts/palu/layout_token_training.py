@@ -122,6 +122,21 @@ def objective_coefficients(control, step, method):
     return gamma, alpha, common
 
 
+def after_complete_update(control, runtime, manifest, config, schedule, args, step, online, torch):
+    """Optional stopping decision, after the optimizer step and before evaluation."""
+    if control is None or not hasattr(control, "after_update"):
+        return False
+    stop = control.after_update(runtime, manifest, config, schedule, args, step, online, torch)
+    if type(stop) is not bool:
+        raise TypeError("Controller after_update must return a boolean")
+    if runtime["distributed"]:
+        decisions = [None] * runtime["world"]
+        torch.distributed.all_gather_object(decisions, stop)
+        if any(value is not stop for value in decisions):
+            raise AssertionError("Ranks disagree on the complete-update stopping decision")
+    return stop
+
+
 def optimizer_groups(model, train_args):
     from transformers.trainer_pt_utils import get_parameter_names
     from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
@@ -543,6 +558,8 @@ def train(args, torch, control=None):
             manifest["completed_updates"] = step
             atomic_json(output / "manifest.json", manifest)
             print(json.dumps({"step": step, "loss": row["loss"], "grad_norm": norm_value, "lr_used": lr_before[0]}), flush=True)
+        stop_after_update = after_complete_update(
+            control, runtime, manifest, config, schedule, args, step, online, torch)
         if online:
             # An epoch edge aligned with an optimizer boundary is evaluated
             # after the update and scheduler step, as in the source HF run.
@@ -553,6 +570,8 @@ def train(args, torch, control=None):
             manifest["checkpoints"].append(checkpoint)
             if rank == 0:
                 atomic_json(output / "manifest.json", manifest)
+        if stop_after_update:
+            break
     if control is not None and control.finish(runtime, manifest, args, torch):
         return
     manifest.update(status="completed" if online else "training_completed", completed_unix=time.time(),

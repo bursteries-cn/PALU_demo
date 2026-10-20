@@ -264,7 +264,8 @@ def build_probe(config, schedule, runtime, output, torch):
     probe.ref_model = reference
     probe.tokenizer = runtime["tokenizer"]
     probe.template_args = cfg.model.template_args
-    probe.args = SimpleNamespace(seed=103, device=runtime["device"])
+    probe.args = SimpleNamespace(seed=int(config["trainer"]["args"].get("seed", 103)),
+                                 device=runtime["device"])
     probe.accelerator = SimpleNamespace(device=runtime["device"], num_processes=1)
     probe.state = SimpleNamespace(global_step=0, epoch=0.0)
     probe.train_dataset = SimpleNamespace(**{split: FrozenSplit(schedule["samples"][split]) for split in ("forget", "retain")})
