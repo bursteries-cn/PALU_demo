@@ -7,15 +7,25 @@ import layout_token_training as base
 from layout_loss_curve_experiment import read_json, read_rows, write_json
 
 
+def threshold_reached(loss, plan):
+    comparison = plan.get("threshold_comparison", "le")
+    if comparison not in ("lt", "le"):
+        raise ValueError("Threshold comparison must be lt or le")
+    return loss < plan["threshold_high"] if comparison == "lt" else loss <= plan["threshold_high"]
+
+
 def stop_decision(step, loss, plan):
+    from forget_until_threshold import probe_steps
     if not math.isfinite(loss) or loss < 0:
         raise ValueError("Fixed Forget loss must be finite and nonnegative")
     if not 1 <= step <= plan["total_updates"]:
         raise ValueError("Stopping probe is outside the update budget")
-    reached = loss <= plan["threshold_high"]
+    if step not in probe_steps(plan):
+        raise ValueError("Stopping decision is outside the frozen probe schedule")
+    reached = threshold_reached(loss, plan)
     if not reached and step < plan["total_updates"]:
         return None
-    hit = plan["threshold_low"] <= loss <= plan["threshold_high"]
+    hit = plan["threshold_low"] <= loss and reached
     reason = ("threshold_reached" if hit else "threshold_overshot") if reached else "budget_exhausted"
     return dict(step=step, raw_sensitive_loss=loss, stop_reason=reason,
                 threshold_reached=reached, band_hit=hit,
@@ -47,11 +57,13 @@ class ForgetThresholdControl:
     run_initial_evaluation = True
 
     def __init__(self, plan):
+        from forget_until_threshold import probe_steps
         self.plan = plan
         self.planned_updates = plan["total_updates"]
         self.decision = None
         self.last_probe = None
-        self._next_probe_step = 1
+        self._next_update_step = 1
+        self.probe_steps = set(probe_steps(plan))
 
     def select_windows(self, windows):
         return windows
@@ -81,16 +93,20 @@ class ForgetThresholdControl:
 
     def after_update(self, runtime, manifest, config, schedule, args, step, online, torch):
         from forget_checkpoint_state import fixed_forget_probe
-        if online is None or step != self._next_probe_step or self.decision is not None:
-            raise ValueError("Expected one probe after each complete update, before its evaluation")
-        self._next_probe_step += 1
+        if online is None or step != self._next_update_step or self.decision is not None:
+            raise ValueError("Expected one control hook after each complete update, before its evaluation")
+        self._next_update_step += 1
+        if step not in self.probe_steps:
+            return False
         self.last_probe = fixed_forget_probe(runtime, schedule, config["trainer"]["method_args"], torch)
         loss = float(self.last_probe["raw_sensitive_loss"])
         self.decision = stop_decision(step, loss, self.plan)
         row = dict(self.last_probe, step=step, measurement="post-update fixed Forget token mean",
                    seed=self.plan["seed"], consumed_pairs=step * 32, pending_pairs=0,
+                   probe_interval=self.plan.get("probe_interval", "update"),
+                   actual_data_epochs=step * 32 / 200,
                    threshold_low=self.plan["threshold_low"], threshold_high=self.plan["threshold_high"],
-                   band_hit=self.plan["threshold_low"] <= loss <= self.plan["threshold_high"],
+                   band_hit=self.plan["threshold_low"] <= loss and threshold_reached(loss, self.plan),
                    stop_reason=self.decision["stop_reason"] if self.decision else None)
         if runtime["rank"] == 0:
             base.append_json(args.output / "forget_probe_history.jsonl", row)
@@ -149,7 +165,7 @@ def validate(study):
     """Audit actual early-stop results, never require all maximum-budget updates."""
     import checkpoint_retention as retention
     from forget_checkpoint_state import validate_resume_files
-    from forget_until_threshold import frozen_plan
+    from forget_until_threshold import frozen_plan, probe_steps
     study, run = Path(study), Path(study) / "run"
     manifest = read_json(run / "manifest.json")
     plan = manifest["threshold_plan"]
@@ -163,8 +179,9 @@ def validate(study):
         raise ValueError("Recorded stopping reason does not match the measured threshold")
     losses = read_rows(run / "loss_history.jsonl")
     probes = read_rows(run / "forget_probe_history.jsonl")
-    if [r["step"] for r in losses] != list(range(1, step + 1)) or [r["step"] for r in probes] != list(range(1, step + 1)):
-        raise ValueError("Incomplete per-update losses or fixed Forget probes")
+    expected_probes = [s for s in probe_steps(plan) if s <= step]
+    if [r["step"] for r in losses] != list(range(1, step + 1)) or [r["step"] for r in probes] != expected_probes:
+        raise ValueError("Incomplete per-update losses or scheduled fixed Forget probes")
     if any(not math.isfinite(r["raw_sensitive_loss"]) or r["raw_sensitive_loss"] < 0
            for r in probes):
         raise ValueError("Fixed Forget probes contain an invalid loss")
@@ -173,7 +190,7 @@ def validate(study):
             raise ValueError("Forget objective changed")
         if any(not math.isclose(lr, plan["learning_rate"], rel_tol=1e-10) for lr in row["lr_before"] + row["lr_after"]):
             raise ValueError("Learning rate changed")
-    if any(r["raw_sensitive_loss"] <= plan["threshold_high"] for r in probes[:-1]):
+    if any(threshold_reached(r["raw_sensitive_loss"], plan) for r in probes[:-1]):
         raise ValueError("Training continued after an earlier threshold crossing")
     if probes[-1]["raw_sensitive_loss"] != decision["raw_sensitive_loss"]:
         raise ValueError("Last fixed probe differs from stopping decision")

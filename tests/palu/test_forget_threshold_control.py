@@ -69,6 +69,43 @@ class StoppingTests(unittest.TestCase):
         manifest = self.exercise_stop(27, .47)
         self.assertEqual(manifest["evaluation_steps"], [0, 13, 25, 27])
 
+    def test_epoch_rule_skips_intermediate_probes_and_uses_strict_upper_boundary(self):
+        from forget_until_threshold import protocol
+        plan = protocol(seed=104, probe_interval="epoch")
+        obj = control.ForgetThresholdControl(plan)
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            manifest = dict(evaluation_steps=[0, 13, 25, 38, 50, 63], final_model_step=63)
+            online = SimpleNamespace(events={s * 32: dict(step=s) for s in manifest["evaluation_steps"]})
+            checked = []
+            for step in range(1, 33):
+                # Exactly 0.5 does not trigger the new strict rule at step25.
+                loss = .39 if step == 32 else .5 if step == 25 else .7
+                with patch("forget_checkpoint_state.fixed_forget_probe",
+                           return_value=dict(raw_sensitive_loss=loss, elapsed_seconds=.1)) as probe:
+                    stopped = obj.after_update(dict(rank=0, distributed=False), manifest,
+                        {"trainer": {"method_args": {}}}, {},
+                        SimpleNamespace(output=output), step, online, None)
+                    if probe.called:
+                        checked.append(step)
+                self.assertEqual(stopped, step == 32)
+            self.assertEqual(checked, [7, 13, 19, 25, 32])
+            rows = [json.loads(x) for x in (output / "forget_probe_history.jsonl").read_text().splitlines()]
+            self.assertEqual([r["step"] for r in rows], checked)
+            self.assertEqual(manifest["evaluation_steps"], [0, 13, 25, 32])
+            self.assertEqual(obj.decision["stop_reason"], "threshold_overshot")
+            self.assertFalse(obj.decision["band_hit"])
+            self.assertEqual(rows[-1]["actual_data_epochs"], 5.12)
+            with self.assertRaisesRegex(ValueError, "probe schedule"):
+                control.stop_decision(28, .49, plan)
+
+    def test_epoch_budget_end_is_checked_even_before_first_epoch(self):
+        from forget_until_threshold import protocol
+        plan = protocol(max_updates=3, probe_interval="epoch")
+        self.assertEqual(control.stop_decision(3, .5, plan)["stop_reason"], "budget_exhausted")
+        self.assertEqual(control.stop_decision(3, .4, plan)["stop_reason"], "threshold_reached")
+        self.assertEqual(control.stop_decision(3, .399, plan)["stop_reason"], "threshold_overshot")
+
     def test_budget_exhaustion_still_marks_and_retains_final_model(self):
         manifest = self.exercise_stop(63, .6)
         self.assertEqual(manifest["stop_decision"]["stop_reason"], "budget_exhausted")

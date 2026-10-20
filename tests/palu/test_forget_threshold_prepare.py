@@ -19,7 +19,10 @@ class PrepareTests(unittest.TestCase):
         plan = experiment.protocol()
         self.assertEqual(plan["phase_weights"], {"forget": [1., 0., 2.]})
         self.assertEqual(plan["retain_updates"], 0)
-        self.assertEqual(plan["probe_every_updates"], 1)
+        self.assertIsNone(plan["probe_every_updates"])
+        self.assertEqual(plan["probe_interval"], "epoch")
+        self.assertEqual(plan["threshold_comparison"], "lt")
+        self.assertEqual(plan["probe_steps"], [7, 13, 19, 25, 32, 38, 44, 50, 57, 63])
         self.assertEqual(plan["max_forget_exposure_epochs"], 10.08)
         events = experiment.evaluation_events(plan)
         self.assertEqual([row["step"] for row in events], [0, 13, 25, 38, 50, 63])
@@ -32,11 +35,30 @@ class PrepareTests(unittest.TestCase):
             self.assertEqual(len(events), len({row["step"] for row in events}))
             self.assertTrue(all(row["step"] <= count for row in events))
 
+    def test_probe_budget_and_old_plan_compatibility(self):
+        for count in (1, 6, 7, 12, 13, 25, 62, 63):
+            plan = experiment.protocol(max_updates=count)
+            steps = experiment.probe_steps(plan)
+            self.assertEqual(steps[-1], count)
+            self.assertEqual(steps, sorted(set(steps)))
+            self.assertTrue(all(0 < step <= count for step in steps))
+        plan = experiment.protocol(probe_interval="update")
+        self.assertEqual(plan["threshold_comparison"], "le")
+        self.assertEqual(plan["probe_every_updates"], 1)
+        self.assertEqual(experiment.probe_steps(plan), list(range(1, 64)))
+        historical = {key: value for key, value in plan.items()
+                      if key not in ("probe_interval", "probe_steps", "threshold_comparison")}
+        self.assertEqual(experiment.probe_steps(historical), list(range(1, 64)))
+        with self.assertRaisesRegex(ValueError, "Frozen probe_steps"):
+            experiment.probe_steps(dict(plan, probe_steps=[63]))
+
     def test_invalid_plan_fails(self):
         for changes in (dict(seed=-1), dict(seed=2**32), dict(seed=True),
                         dict(max_updates=0), dict(max_updates=1.5),
                         dict(threshold_low=.5), dict(threshold_high=float("nan")),
-                        dict(learning_rate=0), dict(learning_rate=float("inf"))):
+                        dict(learning_rate=0), dict(learning_rate=float("inf")),
+                        dict(probe_interval="batch"), dict(threshold_comparison="eq"),
+                        dict(threshold_comparison="")):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 experiment.protocol(**changes)
         self.assertGreaterEqual(experiment.storage_budget(16_000_000_000), 160*(1 << 30))
@@ -71,12 +93,31 @@ class PrepareTests(unittest.TestCase):
                 "config.json": experiment.sha(study/"frozen/config.json")}})
             experiment.write_json(study/"experiment.json", dict(plan, status="prepared"))
             self.assertEqual(experiment.frozen_plan(study), plan)
+            experiment.write_json(study/"experiment.json", dict(plan, probe_interval="update"))
+            with self.assertRaisesRegex(ValueError, "differs from frozen"):
+                experiment.frozen_plan(study)
             experiment.write_json(study/"experiment.json", dict(plan, threshold_high=.6))
             with self.assertRaisesRegex(ValueError, "differs from frozen"):
                 experiment.frozen_plan(study)
             experiment.write_json(study/"frozen/config.json", {"forget_threshold_plan": dict(plan, seed=105)})
             with self.assertRaisesRegex(ValueError, "configuration changed"):
                 experiment.frozen_plan(study)
+
+    def test_frozen_historical_plan_is_read_without_injecting_new_defaults(self):
+        historical = experiment.protocol(probe_interval="update")
+        for key in ("probe_interval", "probe_steps", "threshold_comparison", "probe_policy"):
+            historical.pop(key)
+        with tempfile.TemporaryDirectory() as folder:
+            study = Path(folder)
+            (study/"frozen").mkdir()
+            experiment.write_json(study/"frozen/config.json", {"forget_threshold_plan": historical})
+            experiment.write_json(study/"frozen/manifest.json", {"frozen_file_sha256": {
+                "config.json": experiment.sha(study/"frozen/config.json")}})
+            experiment.write_json(study/"experiment.json", dict(historical, status="prepared"))
+            loaded = experiment.frozen_plan(study)
+            self.assertEqual(loaded, historical)
+            self.assertNotIn("probe_interval", loaded)
+            self.assertEqual(experiment.probe_steps(loaded), list(range(1, 64)))
 
     def test_dry_run_works_without_site_packages_and_train_rejects_overrides(self):
         script = ROOT/"scripts/palu/forget_until_threshold.py"
@@ -85,6 +126,9 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         result = json.loads(completed.stdout)
         self.assertEqual(result["seed"], 105)
+        self.assertEqual(result["probe_interval"], "epoch")
+        self.assertEqual(result["probe_steps"], [7, 13, 19, 25, 32, 38, 44, 50, 57, 63])
+        self.assertEqual(result["threshold_comparison"], "lt")
         rejected = subprocess.run([sys.executable, "-S", str(script), "--mode", "train",
             "--study", "/unused", "--seed", "105"], capture_output=True, text=True)
         self.assertNotEqual(rejected.returncode, 0)
@@ -181,6 +225,8 @@ class FreshScheduleTests(unittest.TestCase):
                 plan = experiment.frozen_plan(study)
                 frozen = torch.load(study/"frozen/schedule.pt", weights_only=True)
                 self.assertEqual(plan["seed"], seed)
+                self.assertEqual(plan["probe_steps"], [7, 13, 19, 25, 32, 38, 44, 50, 57, 63])
+                self.assertEqual(frozen["metadata"]["forget_threshold_plan"], plan)
                 self.assertEqual(len(frozen["windows"]), 63)
                 self.assertEqual(frozen["metadata"]["fixed_dataset_sha256"],
                                  original["metadata"]["fixed_dataset_sha256"])

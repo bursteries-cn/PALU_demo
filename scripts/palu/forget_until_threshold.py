@@ -17,8 +17,30 @@ sys.path[:0] = [str(ROOT / "src"), str(Path(__file__).resolve().parent)]
 from layout_loss_curve_experiment import read_json, read_rows, write_json, sha
 
 
+def probe_steps(plan):
+    """Observe epoch boundaries only after the next completed optimizer update.
+
+    Plans saved before probe_interval was introduced retain their original
+    every-update schedule. Always inspect the budget endpoint.
+    """
+    total = plan["total_updates"]
+    interval = plan.get("probe_interval", "update")
+    if interval == "update":
+        result = list(range(1, total + 1))
+    elif interval == "epoch":
+        batch, size = plan["effective_batch"], plan["phase_epoch_size"]
+        result = sorted({math.ceil(exposure/batch)
+                         for exposure in range(size, total*batch + 1, size)}
+                        | {total})
+    else:
+        raise ValueError("probe_interval must be epoch or update")
+    if "probe_steps" in plan and plan["probe_steps"] != result:
+        raise ValueError("Frozen probe_steps differ from the declared interval and budget")
+    return result
+
+
 def protocol(seed=103, threshold_low=.4, threshold_high=.5, max_updates=63,
-             learning_rate=1e-5):
+             learning_rate=1e-5, probe_interval="epoch", threshold_comparison=None):
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
         raise ValueError("Seed must be an integer in [0, 2**32)")
     if isinstance(max_updates, bool) or not isinstance(max_updates, int) or max_updates <= 0:
@@ -26,7 +48,14 @@ def protocol(seed=103, threshold_low=.4, threshold_high=.5, max_updates=63,
     if (not all(math.isfinite(v) for v in (threshold_low, threshold_high, learning_rate))
             or not 0 <= threshold_low < threshold_high or learning_rate <= 0):
         raise ValueError("Require finite 0 <= lower < upper threshold and positive learning rate")
-    return dict(experiment="palu_forget_until_threshold", seed=seed,
+    if probe_interval not in ("epoch", "update"):
+        raise ValueError("probe_interval must be epoch or update")
+    comparison = (("lt" if probe_interval == "epoch" else "le")
+                  if threshold_comparison is None else threshold_comparison)
+    if comparison not in ("lt", "le"):
+        raise ValueError("threshold_comparison must be lt or le")
+    sign = "<" if comparison == "lt" else "<="
+    plan = dict(experiment="palu_forget_until_threshold", seed=seed,
         threshold_low=float(threshold_low), threshold_high=float(threshold_high),
         learning_rate=learning_rate, scheduler="constant", warmup_steps=0,
         max_updates=max_updates, total_updates=max_updates, forget_updates=max_updates,
@@ -35,9 +64,12 @@ def protocol(seed=103, threshold_low=.4, threshold_high=.5, max_updates=63,
         effective_batch=32, world_size=4, layout="four", microbatch=1,
         accumulation=8, normalization="global", padding_scope="microbatch",
         max_forget_draws=max_updates*32, max_forget_exposure_epochs=max_updates*32/200,
-        probe_every_updates=1, probe_samples=200,
+        probe_interval=probe_interval, threshold_comparison=comparison,
+        probe_every_updates=1 if probe_interval == "update" else None, probe_samples=200,
         probe_loss="post-update raw PALU F on fixed F200; full-dataset sensitive-token mean",
-        stop_policy="First complete update with fixed F <= upper threshold; lower threshold classifies overshoot only",
+        probe_policy=("First complete update at/after each F200 exposure epoch, plus budget endpoint"
+                      if probe_interval == "epoch" else "Every complete update"),
+        stop_policy=f"First scheduled probe with fixed F {sign} upper threshold; lower threshold classifies overshoot only",
         budget_exhaustion_policy="Save and evaluate the last complete update; mark threshold not reached",
         evaluation_backend="sharded", eval_every_epochs=2,
         evaluation_policy="Initial, first complete update at/after every two F200 exposure epochs, and stop point",
@@ -46,6 +78,8 @@ def protocol(seed=103, threshold_low=.4, threshold_high=.5, max_updates=63,
         schedule_origin=("historical_seed103_first_60_updates_then_recorded_extension"
                          if seed == 103 else "fresh_independent_torch_generators_for_F_permutation_and_R_replacement"),
         seed_comparison_note="103 is the historical-pair anchor; 104+ use the recorded fresh sampler, not a replay of seed103")
+    plan["probe_steps"] = probe_steps(plan)
+    return plan
 
 
 def evaluation_events(plan):
@@ -208,6 +242,9 @@ def frozen_plan(study):
     visible = read_json(study / "experiment.json")
     if any(visible.get(key) != value for key, value in plan.items()):
         raise ValueError("Experiment description differs from frozen threshold plan")
+    probe_steps(plan)
+    if plan.get("threshold_comparison", "le") not in ("lt", "le"):
+        raise ValueError("Frozen threshold_comparison must be lt or le")
     return plan
 
 
@@ -257,7 +294,9 @@ def analyze(study, validate_completed=True):
         "`truth_ratio_samples.csv` and `ecdf_points.csv` preserve all evaluated sample IDs. "
         "TR uses geometric wrong-answer probability divided by correct-answer probability "
         "plus 1e-10. `D_low`/`D_high` describe empirical CDF differences, not proof of deletion.\n\n"
-        "The per-update fixed F200 threshold probes are separate from online minibatch losses. "
+        "The scheduled fixed F200 threshold probes are separate from online minibatch losses. "
+        "The frozen plan records probe_interval, probe_steps and the threshold comparison; "
+        "old plans without these fields retain their every-update, <= behavior. "
         "The lower boundary is only an overshoot diagnostic, not an additional stopping condition.\n")
     return report
 
@@ -274,6 +313,8 @@ def parser():
     result.add_argument("--threshold-high", type=float)
     result.add_argument("--max-updates", type=int)
     result.add_argument("--learning-rate", type=float)
+    result.add_argument("--probe-interval", choices=("epoch", "update"))
+    result.add_argument("--threshold-comparison", choices=("lt", "le"))
     return result
 
 
@@ -281,7 +322,8 @@ def main():
     p = parser()
     args = p.parse_args()
     controls = {name: getattr(args, name) for name in
-                ("seed", "threshold_low", "threshold_high", "max_updates", "learning_rate")
+                ("seed", "threshold_low", "threshold_high", "max_updates", "learning_rate",
+                 "probe_interval", "threshold_comparison")
                 if getattr(args, name) is not None}
     if args.mode not in ("prepare", "dry-run") and (controls or args.source_study is not None):
         p.error("train/analyze/export use the frozen plan; do not pass preparation settings")

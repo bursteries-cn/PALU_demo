@@ -1,6 +1,10 @@
 # 先完成遗忘，保存可续训 checkpoint
 
-本轮只训练 `F + 2×common-KL`。在固定 F200 的原始遗忘损失第一次 `≤0.5` 的完整更新后停止，立即评估并保存模型、Adam 与各 rank 的 RNG。**不进入保留阶段，不替用户选择 A/B/C。** `0.4` 只用于标记是否一步跨过目标区间；越过下界也会停止，不为得到区间内结果继续训练或倒退选点。
+后续新实验只训练 `F + 2×common-KL`。**每个 epoch 结束后首个完整更新处固定模型，重新评估全部 F200 的平均遗忘损失，首次 `<0.5` 时停止**，立即评估并保存模型、Adam 与各 rank 的 RNG。`0.4` 仅用于记录是否跌破下界，不是额外停止条件；越界也会停止，不继续训练或倒退选点。F200 平均仍按敏感 token 等权，不是训练过程中不同模型状态的 batch loss 平均。
+
+**当前已经启动的每步检查实验保持原冻结计划，不改变运行进程、样本、停止条件或结果。** 此默认值只影响之后新准备的实验。历史 plan 缺少 `probe_interval` 字段时仍按每步检查、`≤0.5` 停止。**不进入保留阶段，不替用户选择 A/B/C。**
+
+当前串行种子队列结束之前，不在服务器拉取或替换这些脚本：尚未开始的种子会读取磁盘上的代码，而已prepare的实验还会核对代码哈希。新版本仅在后续新实验开始前部署。
 
 ## 启动
 
@@ -18,16 +22,18 @@ SEEDS="104 105 106" FOUR_GPUS=0,1,2,3 \
   bash scripts/palu/run_forget_until_threshold.sh
 ```
 
-默认 source 为 `artifacts/token_equal_seed103/20261017_192348`，结果为 `artifacts/forget_threshold/时间戳/seed_数字`。可用 `SOURCE_STUDY`、`STUDY_DIR`、`PYTHON_BIN` 覆盖位置。`STUDY_DIR` 必须全新；现有结果不会被覆盖。每个种子启动前检查显存；任一失败后停止整个队列并保留观测及错误日志。
+默认 source 为 `artifacts/token_equal_seed103/20261017_192348`，新结果为 `artifacts/forget_threshold_epoch/时间戳/seed_数字`，与旧每步检查的 `forget_threshold/` 分开。可用 `SOURCE_STUDY`、`STUDY_DIR`、`PYTHON_BIN` 覆盖位置。`STUDY_DIR` 必须全新；现有结果不会被覆盖。每个种子启动前检查显存；任一失败后停止整个队列并保留观测及错误日志。
 
 ## 固定条件与阈值
 
 - Llama-3.1-8B 从原始 Full 模型重新开始，每卡 batch1，累积8，四卡有效32对 F/R。
 - 学习率恒定 `1e-5`、无 warmup；F、R、common 各自使用整步有效 token 分母。保留 PALU top5000、first3、mean target、梯度裁剪等原设置。
 - common-KL 权重2始终生效，R 权重0。KL 是 Forget 非敏感位置上学生相对 Full 教师的 KL，并不是向 Retain 模型蒸馏。
-- 每个完整更新后，单独测固定 F200 的敏感 token 等权原始 F。它不同于随机微批 loss、乘权重的 objective，以及正确答案 NLL。
+- 默认 `PROBE_INTERVAL=epoch`：每经过200对曝光，在其后首个完整更新处，单独测固定 F200 的敏感 token 等权原始 F。它不同于随机微批 loss、乘权重的 objective，以及正确答案 NLL。
+- 由于一整步包含32对，而一个 epoch 是200对，二者不总对齐。默认检查步为 `7,13,19,25,32,38,44,50,57,63`，对应 `1.12,2.08,3.04,4,5.12,6.08,7.04,8,9.12,10.08` 轮曝光。这是 epoch 边界之后首个完整更新，不声称精确停在200对边界；没有 pending gradients，最终状态可续训。
+- 首次 `<0.5` 时停止；恰为0.5不会触发，恰为0.4不标记跌破下界。停止点可能已低于0.4，或跳过最佳FQ点，记录真实结果而不改选checkpoint。
 - 默认最多63次完整更新，即2016对曝光、10.08轮。未达到阈值也评估并保存终点，明确标记 `budget_exhausted`，不声称阈值命中。
-- 可通过 `THRESHOLD_LOW`、`THRESHOLD_HIGH`、`MAX_UPDATES`、`LEARNING_RATE` 在 prepare 前改设置。训练只能读取冻结 plan，不接受临时修改这些参数。
+- 可通过 `THRESHOLD_LOW`、`THRESHOLD_HIGH`、`MAX_UPDATES`、`LEARNING_RATE`、`PROBE_INTERVAL` 在 prepare 前改设置。`PROBE_INTERVAL=update` 可复现每完整更新检查的协议，其默认比较为 `≤`；`THRESHOLD_COMPARISON=lt/le` 可显式指定。新 plan 冻结检查步和比较符号，训练只能读取该计划，不接受临时修改这些参数。
 
 seed103 保留旧记录中的前60步配对，并按上一轮同一规则扩展到63步，是历史配对锚点。104–106 使用各自独立的 Torch F 排列生成器和 R 抽样生成器，R 从3800条中有放回抽样；不会仅改 seed 数字而继续重放103配对。冻结样本池相同，数据流、pair origin、样本覆盖量及哈希均留存。103与新种子的配对来源不同，因此不把四条轨迹笼统称为同一采样实现下的四次随机重复；104–106之间采用同一采样实现。
 
@@ -35,7 +41,7 @@ seed103 保留旧记录中的前60步配对，并按上一轮同一规则扩展�
 
 初始、每两轮曝光后首个完整更新、实际停止点均评估 FQ/MU、三项固定原始损失和逐样本 TR。最大预算下的常规评估步为 `0,13,25,38,50,63`；提前停止时只保留已到达的节点并额外评估停止点。第13/38步是第2/6轮边界之后首个完整更新，与旧实验在半累积状态评估第12/37步的时机不同。不会以未完成更新的梯度状态作为后续 A/B/C 的共同起点。
 
-每步 F200 probe 增加前向计算；FQ/MU 仍维持约每两轮一次，避免每步做完整 TOFU 评估。在线随机批损失、固定探针、固定评估损失有独立文件，后续分析应按各自口径比较。
+F200 probe 增加额外学生和教师前向计算。按epoch检查将63步预算内的阈值探针从63次减少到10次，减少了这部分工作量；实际总耗时还取决于停止步、FQ/MU评估、模型保存和I/O，不保证按同样比例加速。FQ/MU仍维持约每两轮一次，停止点另作完整评估。在线随机批损失、固定探针、固定评估损失有独立文件，后续分析应按各自口径比较。
 
 - `frozen/`：配置、F/R 样本与完整计划配对、Retain 参考和文件哈希。
 - `run/loss_history.jsonl`、阈值 probe 记录：逐步原始 F/R/common-KL 与实际系数、固定 F200 的停止依据。
@@ -51,12 +57,12 @@ seed103 保留旧记录中的前60步配对，并按上一轮同一规则扩展�
 实时输出：
 
 ```bash
-tail -f artifacts/forget_threshold/实际时间戳/seed_103/logs/train.log
+tail -f artifacts/forget_threshold_epoch/实际时间戳/seed_103/logs/train.log
 ```
 
 若训练中途失败，可读取已提交的评估并导出，不会假称完整实验通过：
 
 ```bash
 python scripts/palu/forget_until_threshold.py --mode export \
-  --study artifacts/forget_threshold/实际时间戳/seed_103
+  --study artifacts/forget_threshold_epoch/实际时间戳/seed_103
 ```

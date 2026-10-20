@@ -4,7 +4,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 SOURCE_STUDY="${SOURCE_STUDY:-$REPO_ROOT/artifacts/token_equal_seed103/20261017_192348}"
-STUDY_DIR="${STUDY_DIR:-$REPO_ROOT/artifacts/forget_threshold/$(date +%Y%m%d_%H%M%S)}"
+STUDY_DIR="${STUDY_DIR:-$REPO_ROOT/artifacts/forget_threshold_epoch/$(date +%Y%m%d_%H%M%S)}"
+PROBE_INTERVAL="${PROBE_INTERVAL:-epoch}"
 FOUR_GPUS="${FOUR_GPUS:-0,1,2,3}"
 MODE="${MODE:-run}"
 read -r -a SEED_LIST <<< "${SEEDS:-103 104 105 106}"
@@ -29,7 +30,7 @@ done
 if [[ "$MODE" == run && -e "$STUDY_DIR" ]]; then
   printf 'Choose a fresh STUDY_DIR; refusing to overwrite %s\n' "$STUDY_DIR" >&2; exit 2
 fi
-printf 'Sequential seeds: %s; GPUs: %s; no retain stage will run.\n' "${SEED_LIST[*]}" "$FOUR_GPUS"
+printf 'Sequential seeds: %s; GPUs: %s; threshold probes: %s; no retain stage will run.\n' "${SEED_LIST[*]}" "$FOUR_GPUS" "$PROBE_INTERVAL"
 "$PYTHON_BIN" -S - "${SEED_LIST[@]}" <<'PY'
 import sys
 seeds = [int(value) for value in sys.argv[1:]]
@@ -44,7 +45,11 @@ for seed in "${SEED_LIST[@]}"; do
   SEED_STUDY="$STUDY_DIR/seed_$seed"
   ARGS=(--study "$SEED_STUDY" --source-study "$SOURCE_STUDY" --seed "$seed"
     --threshold-low "${THRESHOLD_LOW:-0.4}" --threshold-high "${THRESHOLD_HIGH:-0.5}"
-    --max-updates "${MAX_UPDATES:-63}" --learning-rate "${LEARNING_RATE:-1e-5}")
+    --max-updates "${MAX_UPDATES:-63}" --learning-rate "${LEARNING_RATE:-1e-5}"
+    --probe-interval "$PROBE_INTERVAL")
+  if [[ -n "${THRESHOLD_COMPARISON:-}" ]]; then
+    ARGS+=(--threshold-comparison "$THRESHOLD_COMPARISON")
+  fi
   if [[ "$MODE" == dry-run ]]; then
     CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" "$CONTROL" --mode dry-run "${ARGS[@]}"
     continue
@@ -61,4 +66,8 @@ for seed in "${SEED_LIST[@]}"; do
     2>&1 | tee "$SEED_STUDY/logs/analysis.log"
   printf 'Forget stage complete; checkpoint retained, no retain training: %s\n' "$SEED_STUDY"
 done
-printf 'All requested seeds finished: %s\n' "$STUDY_DIR"
+if [[ "$MODE" == dry-run ]]; then
+  printf 'Dry-run finished; no training started or result directory created: %s\n' "$STUDY_DIR"
+else
+  printf 'All requested seeds finished: %s\n' "$STUDY_DIR"
+fi
