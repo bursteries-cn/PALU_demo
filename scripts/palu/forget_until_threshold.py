@@ -191,7 +191,8 @@ def code_paths():
     return sorted(set(existing() + [ROOT / "scripts/palu" / name for name in
         ("forget_until_threshold.py", "forget_threshold_control.py", "forget_checkpoint_state.py",
          "forget_light_evaluation.py", "run_forget_until_threshold.sh", "README_forget_until_threshold.md",
-         "sample_forget_control.py", "run_sample_forget_threshold.sh", "README_sample_forget_threshold.md")]))
+         "sample_forget_control.py", "run_sample_forget_threshold.sh", "README_sample_forget_threshold.md",
+         "run_global_forget_seed105.sh", "README_global_forget_seed105.md")]))
 
 
 def prepare(study, source, plan):
